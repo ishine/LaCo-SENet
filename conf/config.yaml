@@ -1,0 +1,85 @@
+defaults:
+  - _self_
+  - override hydra/job_logging: colorlog
+  - override hydra/hydra_logging: colorlog
+
+# Dataset
+dset:
+  hf_dataset_id: JacobLinCool/VoiceBank-DEMAND-16k
+  segment: auto
+  use_pcs400: false
+
+# Model
+model:
+  win_len: 400
+  hop_len: 100
+  fft_len: 400
+  compress_factor: 0.3
+  dense_channel: 64
+  sigmoid_beta: 2.0
+  num_tsblock: 4
+  dense_depth: 4
+  time_dw_kernel_size: 3
+  time_block_kernel: [3, 5, 7, 11]
+  freq_block_kernel: [3, 11, 23, 31]
+  time_block_num: 2
+  freq_block_num: 2
+  causal_ts_block: true
+  encoder_padding_ratio: [0.5, 0.5]
+  decoder_padding_ratio: [0.5, 0.5]
+  sca_kernel_size: 11
+
+# Audio processing
+sampling_rate: 16000
+
+batch_size: 8
+max_steps: 800000
+
+log_interval: 500           # log training loss every N steps
+summary_interval: 500       # TensorBoard summary every N steps
+validation_interval: 1000   # run validation every N steps
+best_models_num: 5          # keep top-N models by validation PESQ
+scheduler_step_interval: 2734  # scheduler.step() every N steps (≈1 epoch with VoiceBank)
+
+# Loss related
+loss:
+  magnitude: 0.9
+  phase: 0.3
+  complex: 0.1
+  consistency: 0.05
+  metric: 0.05
+
+# Optimization related
+lr: 5e-4
+lr_decay: 0.99
+optim: adamW
+betas: [0.8, 0.99]
+max_grad_norm: 5.0  # Gradient clipping threshold (prevents gradient explosion)
+
+# Hardware
+device: cuda
+num_workers: 5
+
+continue_from:
+log_dir: tensorbd
+
+# Other stuff
+seed: 2039
+
+# Hydra config
+hydra:
+  run:
+    dir: ./results/experiments/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: true
+  job_logging:
+    handlers:
+      file:
+        class: logging.FileHandler
+        mode: w
+        formatter: colorlog
+        filename: trainer.log
+      console:
+        class: logging.StreamHandler
+        formatter: colorlog
+        stream: ext://sys.stderr
