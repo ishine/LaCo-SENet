@@ -13,10 +13,11 @@ scipy>=1.11.0
 
 # Metrics
 pesq==0.0.4
+pystoi>=0.4.0
 numpy>=1.26.0
 
 # Data
-datasets>=2.14.0
+datasets>=2.14.0,<4.0    # datasets 4.x requires torchcodec (PyTorch ABI compat issues)
 
 # Logging & Monitoring
 tensorboard>=2.15.0
