@@ -39,7 +39,7 @@ log_interval: 500           # log training loss every N steps
 summary_interval: 500       # TensorBoard summary every N steps
 validation_interval: 1000   # run validation every N steps
 best_models_num: 5          # keep top-N models by validation PESQ
-scheduler_step_interval: 2734  # scheduler.step() every N steps (≈1 epoch with VoiceBank)
+scheduler_step_interval: 1447  # scheduler.step() every N steps (≈1 epoch with VoiceBank)
 
 # Loss related
 loss:
