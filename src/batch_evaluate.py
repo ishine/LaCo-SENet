@@ -150,7 +150,7 @@ def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
     return [(d.name, d) for d in exp_dirs]
 
 
-def compute_streaming_lookahead(conf, stft_la=1):
+def compute_streaming_lookahead(conf, chunk_size: int):
     """Compute streaming lookahead info from model config.
 
     Returns dict with enc_la, dec_la, total_la, latency_ms, hop_size, sample_rate.
@@ -160,23 +160,32 @@ def compute_streaming_lookahead(conf, stft_la=1):
     enc_la = compute_right_frames(enc_ratio)
     dec_la = compute_right_frames(dec_ratio)
 
-    input_la = max(stft_la, enc_la)
+    # Match DuBLoNet streaming wrapper behavior:
+    # - input_lookahead_frames starts from encoder lookahead
+    # - ensure at least 2 STFT frames are available for center=True + reflect padding
+    input_la = int(enc_la)
+    if chunk_size + input_la < 2:
+        input_la += (2 - (chunk_size + input_la))
+
     total_la = input_la + dec_la
 
     hop_size = conf.model.get("hop_len", 100)
     sample_rate = conf.get("sampling_rate", 16000)
-    latency_ms = total_la * hop_size / sample_rate * 1000
+    win_size = conf.model.get("win_len", 400)
+    stft_center_delay_samples = win_size // 2  # center=True STFT streaming delay
+    latency_ms = (total_la * hop_size + stft_center_delay_samples) / sample_rate * 1000
 
     return {
         "enc_ratio": enc_ratio,
         "dec_ratio": dec_ratio,
         "enc_la": enc_la,
         "dec_la": dec_la,
-        "stft_la": stft_la,
         "input_la": input_la,
         "total_la": total_la,
         "latency_ms": latency_ms,
         "hop_size": hop_size,
+        "win_size": win_size,
+        "stft_center_delay_samples": stft_center_delay_samples,
         "sample_rate": sample_rate,
     }
 
@@ -225,18 +234,27 @@ def evaluate_fullseq_single(model, data_loader, stft_args, device, logger):
     }
 
 
-def evaluate_streaming_single(streaming_model, data_loader, device, logger):
-    """Run streaming evaluation, return dict of metrics."""
+def evaluate_streaming_single(streaming_model, data_loader, device, logger,
+                              shift_samples=0):
+    """Run streaming evaluation, return dict of metrics.
+
+    Args:
+        shift_samples: Number of leading samples to skip from enhanced signal
+            before metric computation (OLA center shift compensation).
+    """
     results = []
 
     with torch.no_grad():
         for i, data in enumerate(data_loader):
             noisy, clean, _, _ = data
 
-            enhanced = streaming_model.process_audio(noisy.squeeze(0).to(device))
+            enhanced = streaming_model.process_audio_fast(noisy.squeeze(0).to(device))
 
             clean_np = clean.squeeze().numpy()
             enhanced_np = enhanced.cpu().numpy()
+
+            if shift_samples > 0:
+                enhanced_np = enhanced_np[shift_samples:]
 
             # Align lengths
             length = min(len(clean_np), len(enhanced_np))
@@ -463,8 +481,12 @@ def run_streaming(args):
     output_dir = Path(args.output_dir)
     seed_tag = args.exp_pattern.replace("*", "").strip("_")
     split_tag = f"_part{args.split.split('/')[0]}" if args.split else ""
+    align_ola = getattr(args, "align_ola", False)
 
     logger = setup_logging(output_dir)
+
+    if align_ola:
+        logger.info("OLA alignment enabled: will compensate win_size//2 shift")
 
     # Find experiments
     base_dir = Path(args.exp_dir)
@@ -479,6 +501,11 @@ def run_streaming(args):
     logger.info("Loading VoiceBank-DEMAND test set...")
     hf_dataset = load_test_dataset()
     logger.info(f"Test set loaded: {len(hf_dataset)} utterances")
+
+    # Prepare output path (for incremental saves)
+    mode_tag = "streaming_aligned" if align_ola else "streaming"
+    json_path = output_dir / f"eval_results_{mode_tag}_{seed_tag}{split_tag}.json"
+    fullseq_json_path = output_dir / f"eval_results_{seed_tag}.json"
 
     # Evaluate each experiment
     all_results = {}
@@ -506,9 +533,9 @@ def run_streaming(args):
 
             conf = OmegaConf.load(config_path)
 
-            la = compute_streaming_lookahead(conf, stft_la=args.stft_lookahead)
+            la = compute_streaming_lookahead(conf, chunk_size=args.chunk_size)
             logger.info(f"  Padding ratio: enc={la['enc_ratio']}, dec={la['dec_ratio']}")
-            logger.info(f"  Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, stft={la['stft_la']}, total={la['total_la']}")
+            logger.info(f"  Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, total={la['total_la']}")
             logger.info(f"  Latency: {la['latency_ms']:.2f}ms, chunk_size: {args.chunk_size}")
 
             ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
@@ -519,21 +546,25 @@ def run_streaming(args):
                 chunk_size=args.chunk_size,
                 encoder_lookahead=la["enc_la"],
                 decoder_lookahead=la["dec_la"],
-                stft_lookahead_frames=la["stft_la"],
                 device=args.device,
                 verbose=False,
             )
 
-            metrics = evaluate_streaming_single(streaming, ev_loader, args.device, logger)
+            shift_samples = la["win_size"] // 2 if align_ola else 0
+            metrics = evaluate_streaming_single(
+                streaming, ev_loader, args.device, logger,
+                shift_samples=shift_samples,
+            )
 
             all_results[exp_name] = {
                 "best_step": best_step,
                 "valid_pesq": best_info["valid_pesq"],
                 "chunk_size": args.chunk_size,
-                "stft_lookahead": la["stft_la"],
                 "encoder_lookahead": la["enc_la"],
                 "decoder_lookahead": la["dec_la"],
                 "latency_ms": la["latency_ms"],
+                "align_ola": align_ola,
+                "shift_samples": shift_samples,
                 "test_metrics": metrics,
             }
 
@@ -542,6 +573,15 @@ def run_streaming(args):
                      f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
                      f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
             )
+
+            # Incremental save — write after each experiment
+            output_json = dict(all_results)
+            comparison = generate_streaming_comparison(all_results, fullseq_json_path, logger)
+            if comparison:
+                output_json["_comparison"] = comparison
+            with open(json_path, "w") as f:
+                json.dump(output_json, f, indent=2)
+            logger.info(f"  [{len(all_results)}/{len(experiments)}] saved → {json_path}")
 
             del streaming
             torch.cuda.empty_cache()
@@ -556,18 +596,7 @@ def run_streaming(args):
         logger.error("No experiments were successfully evaluated.")
         return
 
-    # Auto-compare with full-seq results if available
-    fullseq_json_path = output_dir / f"eval_results_{seed_tag}.json"
-    comparison = generate_streaming_comparison(all_results, fullseq_json_path, logger)
-
-    # JSON output (with comparison embedded)
-    output_json = dict(all_results)
-    if comparison:
-        output_json["_comparison"] = comparison
-    json_path = output_dir / f"eval_results_streaming_{seed_tag}{split_tag}.json"
-    with open(json_path, "w") as f:
-        json.dump(output_json, f, indent=2)
-    logger.info(f"Results saved to {json_path}")
+    logger.info(f"\nFinal results saved to {json_path}")
 
     # Print summary table
     logger.info(bold(f"\n{'='*80}"))
@@ -636,11 +665,7 @@ def run_chunksweep(args):
 
             conf = OmegaConf.load(config_path)
 
-            la = compute_streaming_lookahead(conf, stft_la=args.stft_lookahead)
-            sample_rate = la["sample_rate"]
-            logger.info(f"  Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, stft={la['stft_la']}, total={la['total_la']}")
-            logger.info(f"  Latency: {la['latency_ms']:.2f}ms")
-
+            sample_rate = conf.get("sampling_rate", 16000)
             ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
 
             # Load model ONCE per experiment
@@ -663,12 +688,15 @@ def run_chunksweep(args):
             chunk_results = {}
 
             for cs in args.chunk_sizes:
+                la = compute_streaming_lookahead(conf, chunk_size=cs)
+                logger.info(f"  [cs={cs}] Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, "
+                            f"total={la['total_la']}, latency={la['latency_ms']:.2f}ms")
+
                 dublonet = DuBLoNet(
                     model=model,
                     chunk_size=cs,
                     encoder_lookahead=la["enc_la"],
                     decoder_lookahead=la["dec_la"],
-                    stft_lookahead_frames=la["stft_la"],
                     hop_size=stft_hop,
                     n_fft=stft_nfft,
                     win_size=stft_win,
@@ -677,7 +705,11 @@ def run_chunksweep(args):
                     freq_size=freq_size,
                 )
 
-                metrics = evaluate_streaming_single(dublonet, ev_loader, args.device, logger)
+                shift_samples = la["win_size"] // 2 if getattr(args, "align_ola", False) else 0
+                metrics = evaluate_streaming_single(
+                    dublonet, ev_loader, args.device, logger,
+                    shift_samples=shift_samples,
+                )
 
                 logger.info(
                     f"  [chunk_size={cs:>3}] "
@@ -691,7 +723,6 @@ def run_chunksweep(args):
 
             all_results[exp_name] = {
                 "best_step": best_step,
-                "stft_lookahead": la["stft_la"],
                 "encoder_lookahead": la["enc_la"],
                 "decoder_lookahead": la["dec_la"],
                 "latency_ms": la["latency_ms"],
@@ -824,8 +855,8 @@ examples:
                           help="Glob pattern to match experiment directories.")
     p_stream.add_argument("--chunk_size", type=int, default=1,
                           help="DuBLoNet chunk size in STFT frames.")
-    p_stream.add_argument("--stft_lookahead", type=int, default=1,
-                          help="STFT lookahead frames. Increase (e.g., 2) for small chunk sizes.")
+    p_stream.add_argument("--align_ola", action="store_true",
+                          help="Compensate OLA center shift (win_size//2 samples)")
     p_stream.add_argument("--split", type=str, default=None,
                           help="Split experiments: 'INDEX/TOTAL' (e.g., '0/2')")
     p_stream.set_defaults(func=run_streaming)
@@ -840,8 +871,8 @@ examples:
     p_sweep.add_argument("--chunk_sizes", type=int, nargs="+",
                          default=[1, 4, 16, 64, 160],
                          help="Chunk sizes (STFT frames) to sweep.")
-    p_sweep.add_argument("--stft_lookahead", type=int, default=1,
-                         help="STFT lookahead frames. Increase (e.g., 2) for small chunk sizes.")
+    p_sweep.add_argument("--align_ola", action="store_true",
+                         help="Compensate OLA center shift (win_size//2 samples)")
     p_sweep.set_defaults(func=run_chunksweep)
 
     return parser

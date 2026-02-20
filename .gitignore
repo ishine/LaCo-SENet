@@ -3,6 +3,7 @@ paper_works/
 __pycache__/
 *.pyc
 *.log
+*.out
 results/experiments/
 scripts/
 ablation/

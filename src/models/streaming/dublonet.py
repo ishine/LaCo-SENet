@@ -6,11 +6,11 @@ convolution problem by buffering features and providing real lookahead context.
 It supports models where encoder, decoder, or both have asymmetric padding.
 
 Processing pipeline:
-1. Input buffering + STFT context:
-   - Accumulate samples until a full processing window is available.
-   - Use an overlap-add friendly STFT configuration (center=True) by prepending
-     win_size/2 samples of context from the previous step and discarding the
-     corresponding context frames in the STFT output.
+1. Input buffering + STFT future buffering:
+   - Accumulate samples until a full processing window is available, including
+     win_size/2 extra samples for real future context.
+   - Use center=False STFT with manually prepended past context (win_size/2)
+     and appended future context (win_size/2) to eliminate reflect padding artifacts.
 2. Encoder + TS_BLOCK:
    - Run the encoder path immediately once the processing window is ready.
    - StatefulConv provides past context via internal state buffers.
@@ -61,7 +61,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.stft import mag_pha_istft, mag_pha_stft
+from src.stft import mag_pha_stft, manual_istft_ola
 
 if TYPE_CHECKING:
     from src.models.streaming.layers.reshape_free_stateful import (
@@ -88,13 +88,11 @@ class DuBLoNet(nn.Module):
 
     Processing pipeline:
 
-    1. **Input buffering + STFT context**:
-       - Accumulates input samples until a full processing window is available.
-       - Uses STFT with center=True and prepends win_size/2 samples of context
-         from the previous step to keep frame alignment stable across chunk
-         boundaries.
-       - Even when encoder_lookahead == 0, at least one STFT lookahead frame is
-         used for stable overlap-add in streaming.
+    1. **Input buffering + STFT future buffering**:
+       - Accumulates input samples until a full processing window is available,
+         including win_size/2 extra samples for real future context.
+       - Uses center=False STFT with manually prepended past context (win_size/2)
+         and appended future context (win_size/2) to eliminate reflect padding.
 
     2. **Encoder Path**:
        - DenseEncoder + TS_BLOCK with StatefulConv
@@ -111,19 +109,21 @@ class DuBLoNet(nn.Module):
        - Uses StateFramesContext to prevent state corruption from lookahead
        - Outputs only current chunk portion (lookahead frames discarded)
 
-    The total latency is measured in frames and includes STFT lookahead:
-        total_lookahead_frames = input_lookahead_frames + decoder_lookahead
-    where:
-        input_lookahead_frames = max(stft_lookahead_frames, encoder_lookahead)
-    and stft_lookahead_frames is at least 1 when center=True.
-    The corresponding sample/seconds latency is:
-        latency_samples = total_lookahead_frames * hop_size
+    5. **Cross-chunk OLA reconstruction**:
+       - Manual iSTFT with cross-chunk overlap-add buffer
+       - Decoder outputs chunk_size frames; OLA buffer carries over the tail
+         (win_size - hop_size samples) between chunks for seamless reconstruction
+
+    The total latency is:
+        total_lookahead_frames = encoder_lookahead + decoder_lookahead
+        stft_future_delay_samples = win_size / 2   (STFT future buffering for real context)
+        latency_samples = total_lookahead_frames * hop_size + stft_future_delay_samples
         latency_seconds = latency_samples / sample_rate
 
     Attributes:
         encoder_lookahead: Frames needed for encoder (0 if encoder is causal)
         decoder_lookahead: Frames needed for decoder (0 if decoder is causal)
-        total_lookahead: input_lookahead_frames + decoder_lookahead
+        total_lookahead: encoder_lookahead + decoder_lookahead
         latency_ms: Total latency in milliseconds
     """
 
@@ -133,7 +133,6 @@ class DuBLoNet(nn.Module):
         chunk_size: int = 64,
         encoder_lookahead: int = 0,
         decoder_lookahead: int = 7,
-        stft_lookahead_frames: int = 1,
         hop_size: int = 100,
         n_fft: int = 400,
         win_size: int = 400,
@@ -152,9 +151,6 @@ class DuBLoNet(nn.Module):
             chunk_size: Number of STFT frames per chunk
             encoder_lookahead: Frames to delay encoder processing (for asymmetric encoder)
             decoder_lookahead: Frames to delay decoder processing (for asymmetric decoder)
-            stft_lookahead_frames: Minimum STFT lookahead frames used for stable streaming
-                overlap-add with center=True. Larger values increase latency but can
-                reduce boundary sensitivity for very small chunk sizes.
             hop_size: STFT hop size in samples
             n_fft: FFT size
             win_size: Window size
@@ -175,31 +171,42 @@ class DuBLoNet(nn.Module):
         self.win_size = win_size
         self.compress_factor = compress_factor
         self.sample_rate = sample_rate
+        # STFT future buffering: use center=False with manual past/future padding
+        # to eliminate reflect padding artifacts in streaming.
+        # - Past context (win_size/2): provided by _stft_context buffer (real past samples)
+        # - Future context (win_size/2): included as extra samples in each chunk
+        # This ensures every STFT frame is computed from real samples, matching full-seq behavior.
+        self.stft_center = False
+        self.stft_future_samples = self.win_size // 2
+        # STFT analysis requires win_size/2 future samples → fixed delay in streaming.
+        self.stft_center_delay_samples = self.stft_future_samples
 
         # Streaming parameters
         self.chunk_size = chunk_size
         self.encoder_lookahead = encoder_lookahead
         self.decoder_lookahead = decoder_lookahead
-        # Even when encoder_lookahead == 0, we need at least 1 frame of input lookahead
-        # for stable STFT/iSTFT streaming with center=True.
-        self.stft_lookahead_frames = max(1, int(stft_lookahead_frames))
-        self.input_lookahead_frames = max(self.stft_lookahead_frames, int(encoder_lookahead))
+        self.input_lookahead_frames = int(encoder_lookahead)
         self.total_lookahead = self.input_lookahead_frames + decoder_lookahead
 
         # Calculate samples per chunk (input)
-        # With center=True STFT (n_fft == win_size), signal_length samples
-        # produce (signal_length // hop_size + 1) frames.
-        # We need total_frames_needed = chunk_size + input_lookahead_frames.
+        # With center=False STFT, we manually provide:
+        #   STFT input = [past_context(W/2) | chunk_samples(samples_per_chunk)]
+        # where chunk_samples includes (total_frames_needed - 1) * hop_size for the model
+        # plus stft_future_samples (W/2) for STFT right-side context.
+        # This produces exactly total_frames_needed frames with no reflect padding.
         self.total_frames_needed = chunk_size + self.input_lookahead_frames
-        self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size
+        self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + self.stft_future_samples
 
         # Output step is ALWAYS chunk_size frames (i.e., chunk_size * hop_size samples).
         # This must match how we slide the input buffer; otherwise, time alignment drifts.
         self.output_frames_per_chunk = chunk_size
         self.output_samples_per_chunk = self.output_frames_per_chunk * hop_size
 
+        # OLA buffer parameters: carry-over tail for cross-chunk overlap-add
+        self.ola_tail_size = win_size - hop_size  # 300 for win=400, hop=100
+
         # Latency calculation
-        self.latency_samples = self.total_lookahead * hop_size
+        self.latency_samples = self.total_lookahead * hop_size + self.stft_center_delay_samples
         self.latency_ms = self.latency_samples / sample_rate * 1000
 
         # Reshape-free TS_BLOCK support
@@ -219,11 +226,14 @@ class DuBLoNet(nn.Module):
         self.input_buffer = torch.tensor([], dtype=torch.float32)
         self.feature_buffer: List[Dict[str, Any]] = []  # Encoded features for decoder lookahead
         self._buffered_frames = 0
-        # STFT context: last win_size/2 samples from previous chunk for proper center=True handling.
-        # Initialize with zeros (silence before audio starts) so the first chunk also gets
-        # context prepended, avoiding reflect-padding failures when samples_per_chunk <= n_fft//2.
+        # STFT past context: last win_size/2 samples from previous chunk.
+        # With center=False, this is prepended to the chunk to provide real past samples
+        # for the leftmost STFT frames. Initialized with zeros (silence before audio starts).
         self._stft_context = torch.zeros(self.win_size // 2, dtype=torch.float32)
-        self._stft_context_frames = self.win_size // (2 * self.hop_size)  # frames to skip after prepending
+
+        # OLA buffer for cross-chunk overlap-add
+        self._ola_buffer = torch.zeros(self.ola_tail_size, dtype=torch.float32)
+        self._ola_norm = torch.zeros(self.ola_tail_size, dtype=torch.float32)
 
         # Initialize reshape-free states if enabled
         if self.use_reshape_free and self.rf_sequence_block is not None:
@@ -295,9 +305,10 @@ class DuBLoNet(nn.Module):
             "chunk_size_frames": self.chunk_size,
             "encoder_lookahead": self.encoder_lookahead,
             "decoder_lookahead": self.decoder_lookahead,
-            "stft_lookahead_frames": self.stft_lookahead_frames,
             "input_lookahead_frames": self.input_lookahead_frames,
             "total_lookahead": self.total_lookahead,
+            "stft_center": self.stft_center,
+            "stft_center_delay_samples": self.stft_center_delay_samples,
             "output_frames_per_chunk": self.output_frames_per_chunk,
             "samples_per_chunk": self.samples_per_chunk,
             "output_samples_per_chunk": self.output_samples_per_chunk,
@@ -317,7 +328,6 @@ class DuBLoNet(nn.Module):
         chunk_size: int = 64,
         encoder_lookahead: int = 0,
         decoder_lookahead: int = 7,
-        stft_lookahead_frames: int = 1,
         use_reshape_free: bool = False,
         device: Optional[str] = None,
         verbose: bool = True,
@@ -403,7 +413,6 @@ class DuBLoNet(nn.Module):
             chunk_size=chunk_size,
             encoder_lookahead=encoder_lookahead,
             decoder_lookahead=decoder_lookahead,
-            stft_lookahead_frames=stft_lookahead_frames,
             hop_size=hop_size,
             n_fft=n_fft,
             win_size=win_size,
@@ -444,20 +453,9 @@ class DuBLoNet(nn.Module):
             hop_size=self.hop_size,
             win_size=self.win_size,
             compress_factor=self.compress_factor,
-            center=True
+            center=self.stft_center
         )
         return com
-
-    def _istft(self, mag: Tensor, pha: Tensor) -> Tensor:
-        """Compute inverse STFT."""
-        return mag_pha_istft(
-            mag, pha,
-            n_fft=self.n_fft,
-            hop_size=self.hop_size,
-            win_size=self.win_size,
-            compress_factor=self.compress_factor,
-            center=True
-        )
 
     def _process_encoder(
         self,
@@ -487,11 +485,10 @@ class DuBLoNet(nn.Module):
         mag, pha = complex_to_mag_pha(spectrogram, stack_dim=-1)
         x = torch.stack((mag, pha), dim=1).permute(0, 1, 3, 2)  # [B, 2, T, F]
 
-        # IMPORTANT:
-        # STFT with center=True can produce extra frames in T depending on input windowing.
-        # We only advance streaming state by `chunk_size` frames per step.
-        # To prevent stateful layers from being updated by any extra frames,
-        # we restrict state updates to the first `valid_frames` frames.
+        # Restrict state updates to chunk_size frames.
+        # T = total_frames_needed = chunk_size + input_lookahead_frames.
+        # Only the first chunk_size frames should update streaming state;
+        # the remaining input_lookahead frames provide future context only.
         valid_frames = min(T, self.chunk_size)
 
         with StateFramesContext(valid_frames):
@@ -537,9 +534,7 @@ class DuBLoNet(nn.Module):
 
         Conditions for immediate processing:
         1. decoder_lookahead == 0
-        2. encoder output frames >= chunk_size + stft_lookahead_frames
-
-        This means "dec=0 AND enough frames available from encoder output for iSTFT".
+        2. encoder output frames >= chunk_size
 
         Args:
             ts_out: Encoder + TS_BLOCK output [B, C, T, F]
@@ -550,10 +545,7 @@ class DuBLoNet(nn.Module):
         if self.decoder_lookahead > 0:
             return False
 
-        available_frames = ts_out.shape[2]
-        needed_for_istft = self.chunk_size + self.stft_lookahead_frames
-
-        return available_frames >= needed_for_istft
+        return ts_out.shape[2] >= self.chunk_size
 
     def _process_decoder_immediate(
         self,
@@ -563,41 +555,28 @@ class DuBLoNet(nn.Module):
         """
         Process decoder immediately without feature buffer (decoder_lookahead=0).
 
-        This path is used when:
-        - decoder_lookahead == 0
-        - encoder output has enough frames for iSTFT (>= chunk_size + stft_lookahead_frames)
-
-        The encoder output's extra frames (from input_lookahead_frames) are used directly
-        for iSTFT overlap-add, eliminating the need for feature buffer accumulation.
-
-        IMPORTANT: StateFramesContext is used to limit state update to chunk_size,
-        preventing lookahead frames from corrupting state for the next chunk.
+        Only chunk_size frames are processed. Cross-chunk OLA handles
+        overlap-add reconstruction without extra frames.
 
         Args:
             ts_out: Encoder + TS_BLOCK output [B, C, T, F]
             mag: Magnitude spectrogram [B, F, T]
 
         Returns:
-            Tuple of (est_mag, est_pha) ready for iSTFT
+            Tuple of (est_mag, est_pha) with T=chunk_size for OLA
         """
         from src.models.streaming.utils import StateFramesContext
 
-        frames_for_istft = self.chunk_size + self.stft_lookahead_frames
+        features = ts_out[:, :, :self.chunk_size, :]
+        chunk_mag = mag[:, :, :self.chunk_size]
 
-        # Use extended features from encoder output directly
-        extended_features = ts_out[:, :, :frames_for_istft, :]
-        extended_mag = mag[:, :, :frames_for_istft]
-
-        # StateFramesContext limits state update to chunk_size
-        # → lookahead frames (stft_lookahead_frames) do NOT corrupt state
         with StateFramesContext(self.chunk_size):
-            mask = self.model.mask_decoder(extended_features).squeeze(1).transpose(1, 2)
-            est_pha = self.model.phase_decoder(extended_features).squeeze(1).transpose(1, 2)
+            mask = self.model.mask_decoder(features).squeeze(1).transpose(1, 2)
+            est_pha = self.model.phase_decoder(features).squeeze(1).transpose(1, 2)
 
-        # Apply mask
         infer_type = getattr(self.model, 'infer_type', 'masking')
         if infer_type == 'masking':
-            est_mag = extended_mag * mask
+            est_mag = chunk_mag * mask
         else:
             est_mag = mask
 
@@ -635,7 +614,7 @@ class DuBLoNet(nn.Module):
         self._buffered_frames += valid_frames
 
         # Step 2: Check if we have enough for decoder processing
-        total_needed = self.chunk_size + self.decoder_lookahead + self.stft_lookahead_frames
+        total_needed = self.chunk_size + self.decoder_lookahead
         if self._buffered_frames < total_needed:
             logger.debug(f"Buffering: {self._buffered_frames}/{total_needed}")
             return None
@@ -659,10 +638,9 @@ class DuBLoNet(nn.Module):
         else:
             est_mag = mask
 
-        # Step 5: Prepare output for iSTFT
-        frames_for_istft = self.chunk_size + self.stft_lookahead_frames
-        est_mag = est_mag[:, :, :frames_for_istft]
-        est_pha = est_pha[:, :, :frames_for_istft]
+        # Step 5: Trim to chunk_size frames for OLA reconstruction
+        est_mag = est_mag[:, :, :self.chunk_size]
+        est_pha = est_pha[:, :, :self.chunk_size]
 
         # Step 6: Update feature buffer
         frames_to_remove = self.chunk_size
@@ -702,7 +680,7 @@ class DuBLoNet(nn.Module):
 
         Returns:
             Tuple of (est_mag, est_pha) if output available, None otherwise
-            Output time dimension is chunk_size + stft_lookahead_frames (for iSTFT)
+            Output time dimension is chunk_size (for cross-chunk OLA)
         """
         with torch.no_grad():
             # Step 1: Encoder + TS_BLOCK (common path)
@@ -715,6 +693,42 @@ class DuBLoNet(nn.Module):
             else:
                 # Buffered mode: Accumulate features and wait for lookahead
                 return self._process_decoder_buffered(ts_out, mag, valid_frames)
+
+    def _manual_istft_ola(self, est_mag: Tensor, est_pha: Tensor) -> Tensor:
+        """
+        Perform manual iSTFT with cross-chunk OLA buffer.
+
+        Uses the OLA buffer state (_ola_buffer, _ola_norm) to carry over
+        overlap-add tail between chunks. Returns exactly output_samples_per_chunk
+        mature samples per call.
+
+        Args:
+            est_mag: [B, F, T] estimated magnitude (compressed)
+            est_pha: [B, F, T] estimated phase
+
+        Returns:
+            [output_samples_per_chunk] mature audio samples
+        """
+        # Ensure OLA buffers are on the correct device
+        if self._ola_buffer.device != est_mag.device:
+            self._ola_buffer = self._ola_buffer.to(est_mag.device)
+            self._ola_norm = self._ola_norm.to(est_mag.device)
+
+        output, new_ola_buffer, new_ola_norm = manual_istft_ola(
+            est_mag, est_pha,
+            n_fft=self.n_fft,
+            hop_size=self.hop_size,
+            win_size=self.win_size,
+            compress_factor=self.compress_factor,
+            ola_buffer=self._ola_buffer,
+            ola_norm=self._ola_norm,
+        )
+
+        # Update carry-over state
+        self._ola_buffer = new_ola_buffer
+        self._ola_norm = new_ola_norm
+
+        return output[:self.output_samples_per_chunk]
 
     def process_samples(self, samples: Tensor) -> Optional[Tensor]:
         """
@@ -747,14 +761,15 @@ class DuBLoNet(nn.Module):
         # Extract chunk for processing
         chunk_samples = self.input_buffer[:self.samples_per_chunk]
 
-        # Prepend STFT context for proper center=True handling.
-        # _stft_context is initialized with zeros (silence) and updated each step,
-        # ensuring STFT frames align correctly across chunk boundaries.
+        # STFT future buffering: prepend real past context and use center=False.
+        # chunk_samples already includes stft_future_samples (W/2) at the end,
+        # providing real future context. Combined with past context, every STFT frame
+        # is computed from real samples with no reflect padding.
+        #   STFT input = [past(W/2) | chunk_samples(N + W/2)]
+        #   → total_frames_needed frames, frame 0 centered at chunk start
         context_size = self.win_size // 2
         chunk_with_context = torch.cat([self._stft_context.to(chunk_samples.device), chunk_samples])
         spectrogram = self._stft(chunk_with_context)
-        # Skip context frames (context_size / hop_size = 2 frames for win=400, hop=100)
-        spectrogram = spectrogram[:, :, self._stft_context_frames:, :]
 
         # Save context for next chunk: the context_size samples immediately
         # before where the next chunk starts (= advance point).
@@ -782,9 +797,8 @@ class DuBLoNet(nn.Module):
 
         est_mag, est_pha = result
 
-        # Compute iSTFT
-        output_audio = self._istft(est_mag, est_pha).squeeze(0)
-        valid_output = output_audio[:self.output_samples_per_chunk]
+        # Reconstruct audio via cross-chunk OLA
+        valid_output = self._manual_istft_ola(est_mag, est_pha)
 
         # Update buffer
         self.input_buffer = self.input_buffer[self.output_samples_per_chunk:]
@@ -835,6 +849,107 @@ class DuBLoNet(nn.Module):
         if len(result) > audio_length:
             result = result[:audio_length]
         return result
+
+    def process_audio_fast(self, audio: Tensor) -> Tensor:
+        """
+        Process a complete audio signal using the 3-phase fast pipeline.
+
+        Eliminates per-chunk STFT/iSTFT overhead by batching them.  The model
+        forward pass (Phase 2) remains sequential because StatefulConv layers
+        are state-dependent.
+
+        Phase 1 — Batched STFT: replicate per-chunk context+samples slicing,
+                  then one batched mag_pha_stft call.
+        Phase 2 — Sequential process_spectrogram_buffered() calls (tight loop).
+        Phase 3 — Batch iSTFT via manual_istft_ola() (single call).
+
+        Produces bit-identical output to process_audio().
+
+        Args:
+            audio: Complete input audio [T] or [1, T]
+
+        Returns:
+            Enhanced audio [T'] where T' <= T
+        """
+        if audio.dim() == 2:
+            audio = audio.squeeze(0)
+
+        audio_length = len(audio)
+        device = self.device
+        audio = audio.to(device)
+
+        # Reset all streaming state
+        self.reset_state()
+
+        # --- Phase 1: Batched STFT ---
+        # Flush padding identical to process_audio()
+        flush_size = self.samples_per_chunk * (self.total_lookahead + 2)
+        padded = torch.cat([audio, torch.zeros(flush_size, device=device)])
+
+        # Pre-pad with context_size zeros to replicate streaming first-chunk
+        # context (zeros). For chunk j, the STFT input is:
+        #   pre_padded[j * osp : j * osp + stft_input_len]
+        # which equals context[j] + chunk_samples[j], matching process_samples().
+        context_size = self.win_size // 2
+        pre_padded = torch.cat([
+            torch.zeros(context_size, device=device),
+            padded,
+        ])
+        osp = self.output_samples_per_chunk
+        stft_input_len = context_size + self.samples_per_chunk
+
+        # Number of spectrogram calls (same count as process_samples processing calls)
+        n_calls = (len(pre_padded) - stft_input_len) // osp + 1
+
+        # Extract overlapping windows using unfold (efficient, no copy)
+        batch_input = pre_padded.unfold(0, stft_input_len, osp)  # [N, stft_input_len]
+        batch_input = batch_input[:n_calls]
+
+        # Single batched STFT (center=False: past/future context already in windows)
+        _, _, batch_com = mag_pha_stft(
+            batch_input,
+            n_fft=self.n_fft,
+            hop_size=self.hop_size,
+            win_size=self.win_size,
+            compress_factor=self.compress_factor,
+            center=False,
+        )
+        # batch_com: [N, F, total_frames_needed, 2] — exact frame count, no skip needed
+
+        # --- Phase 2: Sequential model forward (tight loop) ---
+        all_mag: List[Tensor] = []
+        all_pha: List[Tensor] = []
+
+        for j in range(n_calls):
+            chunk_com = batch_com[j:j + 1]  # [1, F, T, 2]
+            result = self.process_spectrogram_buffered(chunk_com)
+
+            if result is not None:
+                est_mag, est_pha = result
+                all_mag.append(est_mag)
+                all_pha.append(est_pha)
+
+        if not all_mag:
+            return torch.tensor([], device=device)
+
+        # --- Phase 3: Batch iSTFT (single call) ---
+        cat_mag = torch.cat(all_mag, dim=2)  # [1, F, T_out]
+        cat_pha = torch.cat(all_pha, dim=2)  # [1, F, T_out]
+
+        output, _, _ = manual_istft_ola(
+            cat_mag, cat_pha,
+            n_fft=self.n_fft,
+            hop_size=self.hop_size,
+            win_size=self.win_size,
+            compress_factor=self.compress_factor,
+            ola_buffer=None,
+            ola_norm=None,
+        )
+
+        if len(output) > audio_length:
+            output = output[:audio_length]
+
+        return output
 
     def forward(self, x: Tensor) -> Tensor:
         """Forward pass for nn.Module compatibility."""
