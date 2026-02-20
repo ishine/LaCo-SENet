@@ -227,14 +227,21 @@ def rf_to_segment(
     hop_len: int | None = None,
     win_len: int | None = None,
     sampling_rate: int = 16000,
+    center: bool = True,
 ) -> int:
     """Compute the minimum training segment size (in samples) from model RF.
 
     Returns RF in samples, aligned up to the nearest multiple of hop_len.
+
+    When center=False, adds n_fft samples to compensate for the lack of
+    center padding, ensuring the same number of STFT frames as center=True.
     """
     rf = compute_receptive_field(param, hop_len, win_len, sampling_rate)
     hop = rf.hop_len
     samples = rf.total_rf_samples
+    if not center:
+        n_fft = rf.win_len  # n_fft == win_len in this codebase
+        samples += n_fft
     # Align up to hop_len multiple
     aligned = ((samples + hop - 1) // hop) * hop
     return aligned

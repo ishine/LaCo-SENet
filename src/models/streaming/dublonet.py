@@ -140,6 +140,7 @@ class DuBLoNet(nn.Module):
         sample_rate: int = 16000,
         rf_sequence_block: Optional[nn.ModuleList] = None,
         freq_size: int = 100,
+        stft_center: bool = True,
     ):
         """
         Initialize DuBLoNet.
@@ -171,15 +172,19 @@ class DuBLoNet(nn.Module):
         self.win_size = win_size
         self.compress_factor = compress_factor
         self.sample_rate = sample_rate
-        # STFT future buffering: use center=False with manual past/future padding
-        # to eliminate reflect padding artifacts in streaming.
-        # - Past context (win_size/2): provided by _stft_context buffer (real past samples)
-        # - Future context (win_size/2): included as extra samples in each chunk
-        # This ensures every STFT frame is computed from real samples, matching full-seq behavior.
-        self.stft_center = False
-        self.stft_future_samples = self.win_size // 2
-        # STFT analysis requires win_size/2 future samples → fixed delay in streaming.
-        self.stft_center_delay_samples = self.stft_future_samples
+        # Training STFT center mode:
+        # stft_center=True: model trained with center=True STFT.
+        #   Streaming emulates via center=False + manual context buffers
+        #   (win_size/2 past + win_size/2 future), adding stft_center_delay.
+        # stft_center=False: model trained with center=False STFT.
+        #   Streaming uses center=False directly, no context buffers needed.
+        self.stft_center = stft_center
+        if stft_center:
+            self.stft_future_samples = self.win_size // 2
+            self.stft_center_delay_samples = self.stft_future_samples
+        else:
+            self.stft_future_samples = 0
+            self.stft_center_delay_samples = 0
 
         # Streaming parameters
         self.chunk_size = chunk_size
@@ -188,14 +193,15 @@ class DuBLoNet(nn.Module):
         self.input_lookahead_frames = int(encoder_lookahead)
         self.total_lookahead = self.input_lookahead_frames + decoder_lookahead
 
-        # Calculate samples per chunk (input)
-        # With center=False STFT, we manually provide:
-        #   STFT input = [past_context(W/2) | chunk_samples(samples_per_chunk)]
-        # where chunk_samples includes (total_frames_needed - 1) * hop_size for the model
-        # plus stft_future_samples (W/2) for STFT right-side context.
-        # This produces exactly total_frames_needed frames with no reflect padding.
         self.total_frames_needed = chunk_size + self.input_lookahead_frames
-        self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + self.stft_future_samples
+        if stft_center:
+            # center=True: chunk includes stft_future_samples (W/2) for STFT right context.
+            # Full STFT input = [past_context(W/2) | chunk_samples(N + W/2)]
+            self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + self.stft_future_samples
+        else:
+            # center=False: STFT(center=False) needs (T-1)*hop + n_fft samples for T frames.
+            # No context prepending needed.
+            self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + n_fft
 
         # Output step is ALWAYS chunk_size frames (i.e., chunk_size * hop_size samples).
         # This must match how we slide the input buffer; otherwise, time alignment drifts.
@@ -226,10 +232,12 @@ class DuBLoNet(nn.Module):
         self.input_buffer = torch.tensor([], dtype=torch.float32)
         self.feature_buffer: List[Dict[str, Any]] = []  # Encoded features for decoder lookahead
         self._buffered_frames = 0
-        # STFT past context: last win_size/2 samples from previous chunk.
-        # With center=False, this is prepended to the chunk to provide real past samples
-        # for the leftmost STFT frames. Initialized with zeros (silence before audio starts).
-        self._stft_context = torch.zeros(self.win_size // 2, dtype=torch.float32)
+        if self.stft_center:
+            # center=True: STFT past context buffer for center emulation
+            self._stft_context = torch.zeros(self.win_size // 2, dtype=torch.float32)
+        else:
+            # center=False: no context buffer needed
+            self._stft_context = None
 
         # OLA buffer for cross-chunk overlap-add
         self._ola_buffer = torch.zeros(self.ola_tail_size, dtype=torch.float32)
@@ -403,6 +411,7 @@ class DuBLoNet(nn.Module):
         n_fft = getattr(model_params, 'n_fft', 400)
         win_size = getattr(model_params, 'win_size', 400)
         compress_factor = getattr(model_params, 'compress_factor', 0.3)
+        stft_center = getattr(model_params, 'stft_center', True)
 
         # Calculate freq_size for state initialization
         freq_size = n_fft // 2 + 1  # Default to STFT frequency bins
@@ -419,6 +428,7 @@ class DuBLoNet(nn.Module):
             compress_factor=compress_factor,
             rf_sequence_block=rf_sequence_block,
             freq_size=freq_size,
+            stft_center=stft_center,
         )
 
         # Store config
@@ -443,7 +453,11 @@ class DuBLoNet(nn.Module):
         return instance
 
     def _stft(self, audio: Tensor) -> Tensor:
-        """Compute STFT and return complex spectrogram."""
+        """Compute STFT and return complex spectrogram.
+
+        Always uses center=False internally. For models trained with
+        center=True, context emulation is handled by process_samples.
+        """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
 
@@ -453,7 +467,7 @@ class DuBLoNet(nn.Module):
             hop_size=self.hop_size,
             win_size=self.win_size,
             compress_factor=self.compress_factor,
-            center=self.stft_center
+            center=False,
         )
         return com
 
@@ -748,7 +762,7 @@ class DuBLoNet(nn.Module):
         samples = samples.to(self.device)
 
         # Ensure STFT context is on the same device (needed on first call after reset)
-        if self._stft_context.device != samples.device:
+        if self.stft_center and self._stft_context.device != samples.device:
             self._stft_context = self._stft_context.to(samples.device)
 
         # Add to buffer
@@ -761,30 +775,24 @@ class DuBLoNet(nn.Module):
         # Extract chunk for processing
         chunk_samples = self.input_buffer[:self.samples_per_chunk]
 
-        # STFT future buffering: prepend real past context and use center=False.
-        # chunk_samples already includes stft_future_samples (W/2) at the end,
-        # providing real future context. Combined with past context, every STFT frame
-        # is computed from real samples with no reflect padding.
-        #   STFT input = [past(W/2) | chunk_samples(N + W/2)]
-        #   → total_frames_needed frames, frame 0 centered at chunk start
-        context_size = self.win_size // 2
-        chunk_with_context = torch.cat([self._stft_context.to(chunk_samples.device), chunk_samples])
-        spectrogram = self._stft(chunk_with_context)
+        if self.stft_center:
+            # center=True training: prepend real past context for STFT emulation.
+            context_size = self.win_size // 2
+            chunk_with_context = torch.cat([self._stft_context.to(chunk_samples.device), chunk_samples])
+            spectrogram = self._stft(chunk_with_context)
 
-        # Save context for next chunk: the context_size samples immediately
-        # before where the next chunk starts (= advance point).
-        # When output_samples_per_chunk >= context_size, these are entirely
-        # within the current buffer.  When output_samples_per_chunk < context_size
-        # (e.g. chunk_size=1), we need to combine the tail of the previous
-        # context with the current buffer's leading samples.
-        advance = self.output_samples_per_chunk
-        if advance >= context_size:
-            self._stft_context = self.input_buffer[advance - context_size:advance].clone()
+            # Save context for next chunk
+            advance = self.output_samples_per_chunk
+            if advance >= context_size:
+                self._stft_context = self.input_buffer[advance - context_size:advance].clone()
+            else:
+                need_from_prev = context_size - advance
+                prev_part = self._stft_context[len(self._stft_context) - need_from_prev:]
+                curr_part = self.input_buffer[:advance]
+                self._stft_context = torch.cat([prev_part, curr_part]).clone()
         else:
-            need_from_prev = context_size - advance
-            prev_part = self._stft_context[len(self._stft_context) - need_from_prev:]
-            curr_part = self.input_buffer[:advance]
-            self._stft_context = torch.cat([prev_part, curr_part]).clone()
+            # center=False training: direct STFT, no context needed
+            spectrogram = self._stft(chunk_samples)
 
         # Process through buffered model
         result = self.process_spectrogram_buffered(spectrogram)
@@ -886,17 +894,19 @@ class DuBLoNet(nn.Module):
         flush_size = self.samples_per_chunk * (self.total_lookahead + 2)
         padded = torch.cat([audio, torch.zeros(flush_size, device=device)])
 
-        # Pre-pad with context_size zeros to replicate streaming first-chunk
-        # context (zeros). For chunk j, the STFT input is:
-        #   pre_padded[j * osp : j * osp + stft_input_len]
-        # which equals context[j] + chunk_samples[j], matching process_samples().
-        context_size = self.win_size // 2
-        pre_padded = torch.cat([
-            torch.zeros(context_size, device=device),
-            padded,
-        ])
         osp = self.output_samples_per_chunk
-        stft_input_len = context_size + self.samples_per_chunk
+        if self.stft_center:
+            # center=True: prepend context_size zeros to replicate streaming context
+            context_size = self.win_size // 2
+            pre_padded = torch.cat([
+                torch.zeros(context_size, device=device),
+                padded,
+            ])
+            stft_input_len = context_size + self.samples_per_chunk
+        else:
+            # center=False: no context prepending needed
+            pre_padded = padded
+            stft_input_len = self.samples_per_chunk
 
         # Number of spectrogram calls (same count as process_samples processing calls)
         n_calls = (len(pre_padded) - stft_input_len) // osp + 1

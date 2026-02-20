@@ -21,7 +21,31 @@ def mag_pha_istft(mag, pha, n_fft, hop_size, win_size, compress_factor=1.0, cent
     mag = torch.pow(mag, (1.0/compress_factor))
     com = torch.complex(mag*torch.cos(pha), mag*torch.sin(pha))
     hann_window = torch.hann_window(win_size).to(com.device)
-    wav = torch.istft(com, n_fft=n_fft, hop_length=hop_size, win_length=win_size, window=hann_window, center=center)
+
+    if center:
+        wav = torch.istft(com, n_fft=n_fft, hop_length=hop_size, win_length=win_size, window=hann_window, center=True)
+    else:
+        # torch.istft(center=False) fails COLA check with Hann window.
+        # Use manual OLA reconstruction instead.
+        frames = torch.fft.irfft(com.transpose(-2, -1), n=n_fft)  # [B, T, n_fft]
+        frames = frames[..., :win_size]  # [B, T, win_size]
+        frames = frames * hann_window
+        window_sq = hann_window * hann_window
+
+        B, T = frames.shape[:2]
+        output_len = (T - 1) * hop_size + win_size
+
+        buf = torch.zeros(B, output_len, device=com.device, dtype=frames.dtype)
+        norm = torch.zeros(output_len, device=com.device, dtype=frames.dtype)
+
+        for t in range(T):
+            start = t * hop_size
+            buf[:, start:start + win_size] += frames[:, t]
+            norm[start:start + win_size] += window_sq
+
+        safe_mask = norm > 1e-8
+        buf[:, safe_mask] = buf[:, safe_mask] / norm[safe_mask]
+        wav = buf
 
     return wav
 

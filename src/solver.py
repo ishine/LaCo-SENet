@@ -322,6 +322,11 @@ class Solver(object):
 
                 clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **self.stft_args)
 
+                # Align lengths (center=False may produce different output length)
+                min_len = min(clean.shape[-1], clean_hat.shape[-1])
+                clean = clean[..., :min_len]
+                clean_hat = clean_hat[..., :min_len]
+
                 clean_list.append(clean.squeeze().detach().cpu().numpy())
                 clean_hat_list.append(clean_hat.squeeze().detach().cpu().numpy())
 

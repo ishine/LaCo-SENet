@@ -161,18 +161,19 @@ def compute_streaming_lookahead(conf, chunk_size: int):
     dec_la = compute_right_frames(dec_ratio)
 
     # Match DuBLoNet streaming wrapper behavior:
-    # - input_lookahead_frames starts from encoder lookahead
-    # - ensure at least 2 STFT frames are available for center=True + reflect padding
+    # - input_lookahead_frames = encoder lookahead (no min-2-frame hack needed)
+    # - STFT future buffering (center=False) eliminates reflect padding requirement
     input_la = int(enc_la)
-    if chunk_size + input_la < 2:
-        input_la += (2 - (chunk_size + input_la))
-
     total_la = input_la + dec_la
 
     hop_size = conf.model.get("hop_len", 100)
     sample_rate = conf.get("sampling_rate", 16000)
     win_size = conf.model.get("win_len", 400)
-    stft_center_delay_samples = win_size // 2  # center=True STFT streaming delay
+    stft_center = conf.model.get("stft_center", True)
+    if stft_center:
+        stft_center_delay_samples = win_size // 2  # STFT future buffering delay
+    else:
+        stft_center_delay_samples = 0
     latency_ms = (total_la * hop_size + stft_center_delay_samples) / sample_rate * 1000
 
     return {
@@ -185,6 +186,7 @@ def compute_streaming_lookahead(conf, chunk_size: int):
         "latency_ms": latency_ms,
         "hop_size": hop_size,
         "win_size": win_size,
+        "stft_center": stft_center,
         "stft_center_delay_samples": stft_center_delay_samples,
         "sample_rate": sample_rate,
     }
@@ -550,7 +552,7 @@ def run_streaming(args):
                 verbose=False,
             )
 
-            shift_samples = la["win_size"] // 2 if align_ola else 0
+            shift_samples = la["stft_center_delay_samples"] if align_ola else 0
             metrics = evaluate_streaming_single(
                 streaming, ev_loader, args.device, logger,
                 shift_samples=shift_samples,
@@ -703,9 +705,10 @@ def run_chunksweep(args):
                     compress_factor=stft_compress,
                     sample_rate=sample_rate,
                     freq_size=freq_size,
+                    stft_center=la["stft_center"],
                 )
 
-                shift_samples = la["win_size"] // 2 if getattr(args, "align_ola", False) else 0
+                shift_samples = la["stft_center_delay_samples"] if getattr(args, "align_ola", False) else 0
                 metrics = evaluate_streaming_single(
                     dublonet, ev_loader, args.device, logger,
                     shift_samples=shift_samples,

@@ -79,9 +79,10 @@ def run(args):
 
     # Determine training segment size
     from src.receptive_field import compute_receptive_field, rf_to_segment
+    stft_center = args.model.get("stft_center", True)
     raw_segment = args.dset.get("segment", 64000)
     if raw_segment == "auto":
-        segment = rf_to_segment(args.model, sampling_rate=args.sampling_rate)
+        segment = rf_to_segment(args.model, sampling_rate=args.sampling_rate, center=stft_center)
         rf = compute_receptive_field(args.model, sampling_rate=args.sampling_rate)
         logger.info(f"Auto segment from RF: {rf.total_rf_frames} frames = "
                     f"{rf.total_rf_samples} samples -> aligned to {segment} samples "
