@@ -4,4 +4,8 @@ __pycache__/
 *.pyc
 *.log
 results/experiments/
-.mcp.json
+scripts/
+ablation/
+debug/
+CLAUDE.md
+evaluation/

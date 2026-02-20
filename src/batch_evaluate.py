@@ -1,0 +1,857 @@
+"""
+Unified batch evaluation script for DuBLoNet experiments.
+
+Three subcommands cover all evaluation modes:
+
+  fullseq     — Full-sequence (non-streaming) evaluation (baseline).
+  streaming   — Streaming evaluation with a single chunk_size.
+  chunksweep  — Chunk-size sweep across multiple chunk_sizes.
+
+Usage:
+    python -m src.batch_evaluate fullseq --exp_pattern "*s2039" --device cuda
+    python -m src.batch_evaluate streaming --exp_pattern "*s2039" --chunk_size 1 --device cuda
+    python -m src.batch_evaluate chunksweep --experiments M1_6.25ms_s2039 --chunk_sizes 1 64 --device cuda
+
+    # Split across 2 GPUs (fullseq / streaming):
+    python -m src.batch_evaluate fullseq --exp_pattern "*s2039" --device cuda:0 --split 0/2 &
+    python -m src.batch_evaluate fullseq --exp_pattern "*s2039" --device cuda:1 --split 1/2 &
+"""
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+import argparse
+import json
+import logging
+import torch
+import numpy as np
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+
+from src.compute_metrics import compute_metrics
+from src.data import VoiceBankDataset
+from src.utils import bold
+
+METRICS_LIST = ["pesq", "stoi", "csig", "cbak", "covl", "segSNR"]
+
+
+# ============================================================================
+# Section 2: Shared utility functions
+# ============================================================================
+
+def find_best_checkpoint(exp_dir: Path) -> dict:
+    """Load states.th and return best model info (step, valid_pesq_value)."""
+    states_path = exp_dir / "states.th"
+    if not states_path.exists():
+        raise FileNotFoundError(f"states.th not found in {exp_dir}")
+
+    states = torch.load(states_path, map_location="cpu", weights_only=False)
+    best_models = states.get("best_models", [])
+    if not best_models:
+        raise ValueError(f"No best_models found in {exp_dir}/states.th")
+
+    best = best_models[0]
+    return {
+        "step": best["steps"],
+        "valid_pesq": best["valid_pesq_value"],
+    }
+
+
+def compute_right_frames(padding_ratio, depth=4):
+    """
+    Compute total right padding frames from padding_ratio for DS_DDB.
+
+    DS_DDB: depth=4, kernel_size=3, dilations=[1,2,4,8].
+    Each layer: time_padding_total = 2 * dilation.
+    Matches AsymmetricConv2d rounding logic (Python banker's rounding).
+    """
+    left_ratio, right_ratio = padding_ratio
+    total_right = 0
+    for i in range(depth):
+        dilation = 2 ** i
+        time_padding_total = dilation * 2
+        left = round(time_padding_total * left_ratio)
+        right = round(time_padding_total * right_ratio)
+        if left + right != time_padding_total:
+            right = time_padding_total - left
+        total_right += right
+    return total_right
+
+
+def setup_logging(output_dir):
+    """Configure logging to stderr only."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
+    return logging.getLogger(__name__)
+
+
+def load_test_dataset():
+    """Load VoiceBank-DEMAND 16kHz test split from HuggingFace."""
+    return load_dataset("JacobLinCool/VoiceBank-DEMAND-16k", split="test")
+
+
+def create_data_loader(hf_dataset, conf, num_workers):
+    """Create a DataLoader for evaluation (batch_size=1)."""
+    use_pcs400 = conf.dset.get("use_pcs400", False)
+    ev_dataset = VoiceBankDataset(
+        hf_dataset, segment=None, with_id=True, with_text=True,
+        use_pcs400=use_pcs400,
+    )
+    return DataLoader(
+        dataset=ev_dataset,
+        batch_size=1,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+
+def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
+    """Find experiment directories by glob pattern or explicit names.
+
+    Returns list of (exp_name, exp_dir) tuples.
+    """
+    if exp_names is not None:
+        # Explicit names (chunksweep mode)
+        results = []
+        for name in exp_names:
+            d = base_dir / name
+            if not d.exists():
+                logging.getLogger(__name__).error(f"Experiment directory not found: {d}")
+                continue
+            results.append((name, d))
+        return results
+
+    # Glob pattern (fullseq / streaming mode)
+    exp_dirs = sorted(base_dir.glob(exp_pattern))
+    if not exp_dirs:
+        return []
+
+    # Apply split if specified
+    if split:
+        split_idx, split_total = map(int, split.split("/"))
+        n = len(exp_dirs)
+        chunk_size = n // split_total
+        remainder = n % split_total
+        start = split_idx * chunk_size + min(split_idx, remainder)
+        end = start + chunk_size + (1 if split_idx < remainder else 0)
+        exp_dirs = exp_dirs[start:end]
+        logging.getLogger(__name__).info(
+            f"Split {split_idx}/{split_total}: processing experiments [{start}:{end}]"
+        )
+
+    return [(d.name, d) for d in exp_dirs]
+
+
+def compute_streaming_lookahead(conf, stft_la=1):
+    """Compute streaming lookahead info from model config.
+
+    Returns dict with enc_la, dec_la, total_la, latency_ms, hop_size, sample_rate.
+    """
+    enc_ratio = list(conf.model.encoder_padding_ratio)
+    dec_ratio = list(conf.model.decoder_padding_ratio)
+    enc_la = compute_right_frames(enc_ratio)
+    dec_la = compute_right_frames(dec_ratio)
+
+    input_la = max(stft_la, enc_la)
+    total_la = input_la + dec_la
+
+    hop_size = conf.model.get("hop_len", 100)
+    sample_rate = conf.get("sampling_rate", 16000)
+    latency_ms = total_la * hop_size / sample_rate * 1000
+
+    return {
+        "enc_ratio": enc_ratio,
+        "dec_ratio": dec_ratio,
+        "enc_la": enc_la,
+        "dec_la": dec_la,
+        "stft_la": stft_la,
+        "input_la": input_la,
+        "total_la": total_la,
+        "latency_ms": latency_ms,
+        "hop_size": hop_size,
+        "sample_rate": sample_rate,
+    }
+
+
+# ============================================================================
+# Section 3: Evaluation functions (per-mode)
+# ============================================================================
+
+def evaluate_fullseq_single(model, data_loader, stft_args, device, logger):
+    """Run full-sequence evaluation, return dict of metrics."""
+    from src.stft import mag_pha_stft, mag_pha_istft
+
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        for i, data in enumerate(data_loader):
+            noisy, clean, _, _ = data
+
+            noisy_com = mag_pha_stft(noisy, **stft_args)[2].to(device)
+            clean_mag_hat, clean_pha_hat, _ = model(noisy_com)
+            clean_hat = mag_pha_istft(clean_mag_hat, clean_pha_hat, **stft_args)
+
+            clean_np = clean.squeeze().detach().cpu().numpy()
+            clean_hat_np = clean_hat.squeeze().detach().cpu().numpy()
+
+            # Align lengths
+            if len(clean_np) != len(clean_hat_np):
+                length = min(len(clean_np), len(clean_hat_np))
+                clean_np = clean_np[:length]
+                clean_hat_np = clean_hat_np[:length]
+
+            results.append(compute_metrics(clean_np, clean_hat_np))
+
+            if (i + 1) % 100 == 0:
+                logger.info(f"  Processed {i + 1}/{len(data_loader)} utterances")
+
+    pesq, csig, cbak, covl, segSNR, stoi = np.mean(results, axis=0)
+    return {
+        "pesq": float(pesq),
+        "stoi": float(stoi),
+        "csig": float(csig),
+        "cbak": float(cbak),
+        "covl": float(covl),
+        "segSNR": float(segSNR),
+    }
+
+
+def evaluate_streaming_single(streaming_model, data_loader, device, logger):
+    """Run streaming evaluation, return dict of metrics."""
+    results = []
+
+    with torch.no_grad():
+        for i, data in enumerate(data_loader):
+            noisy, clean, _, _ = data
+
+            enhanced = streaming_model.process_audio(noisy.squeeze(0).to(device))
+
+            clean_np = clean.squeeze().numpy()
+            enhanced_np = enhanced.cpu().numpy()
+
+            # Align lengths
+            length = min(len(clean_np), len(enhanced_np))
+            clean_np = clean_np[:length]
+            enhanced_np = enhanced_np[:length]
+
+            results.append(compute_metrics(clean_np, enhanced_np))
+
+            if (i + 1) % 100 == 0:
+                logger.info(f"  Processed {i + 1}/{len(data_loader)} utterances")
+
+    pesq, csig, cbak, covl, segSNR, stoi = np.mean(results, axis=0)
+    return {
+        "pesq": float(pesq),
+        "stoi": float(stoi),
+        "csig": float(csig),
+        "cbak": float(cbak),
+        "covl": float(covl),
+        "segSNR": float(segSNR),
+    }
+
+
+# ============================================================================
+# Section 4: Comparison / summary builders (per-mode)
+# ============================================================================
+
+def generate_streaming_comparison(streaming_results, fullseq_path, logger):
+    """Compare streaming vs full-seq results, return comparison dict."""
+    if not fullseq_path.exists():
+        logger.info(f"Full-seq results not found at {fullseq_path}, skipping comparison.")
+        return {}
+
+    with open(fullseq_path, "r") as f:
+        fullseq_results = json.load(f)
+
+    comparison = {}
+    for exp_name, s_result in streaming_results.items():
+        if exp_name not in fullseq_results:
+            continue
+
+        f_metrics = fullseq_results[exp_name]["test_metrics"]
+        s_metrics = s_result["test_metrics"]
+
+        entry = {
+            "fullseq_pesq": f_metrics["pesq"],
+            "streaming_pesq": s_metrics["pesq"],
+        }
+        for metric in METRICS_LIST:
+            entry[f"delta_{metric}"] = round(s_metrics[metric] - f_metrics[metric], 6)
+
+        comparison[exp_name] = entry
+
+    # Summary
+    if comparison:
+        delta_pesqs = [abs(v["delta_pesq"]) for v in comparison.values()]
+        comparison["_summary"] = {
+            "max_abs_delta_pesq": round(max(delta_pesqs), 6),
+            "mean_abs_delta_pesq": round(float(np.mean(delta_pesqs)), 6),
+        }
+
+    return comparison
+
+
+def build_chunksweep_comparison(all_results, fullseq_path, logger):
+    """Build comparison: each (exp, chunk) vs full-sequence baseline.
+
+    Returns (comparison_dict, summary_dict) or (None, None) if no baseline.
+    """
+    if not fullseq_path.exists():
+        logger.info(f"Full-seq results not found at {fullseq_path}, skipping comparison.")
+        return None, None
+
+    with open(fullseq_path, "r") as f:
+        fullseq_results = json.load(f)
+
+    comparison = {}
+
+    for exp_name, exp_data in all_results.items():
+        if exp_name not in fullseq_results:
+            continue
+
+        f_metrics = fullseq_results[exp_name]["test_metrics"]
+        chunk_results = exp_data["chunk_results"]
+
+        entry = {"fullseq_pesq": f_metrics["pesq"], "chunk_deltas": {}}
+        max_abs_deltas = {m: 0.0 for m in METRICS_LIST}
+
+        for cs_str, c_metrics in chunk_results.items():
+            deltas = {}
+            for m in METRICS_LIST:
+                delta = round(c_metrics[m] - f_metrics[m], 6)
+                deltas[f"delta_{m}"] = delta
+                max_abs_deltas[m] = max(max_abs_deltas[m], abs(delta))
+            entry["chunk_deltas"][cs_str] = deltas
+
+        entry["max_abs_delta_pesq"] = round(max_abs_deltas["pesq"], 6)
+        comparison[exp_name] = entry
+
+    # Global summary
+    summary = None
+    if comparison:
+        all_max_delta_pesq = [v["max_abs_delta_pesq"] for v in comparison.values()]
+        global_max = max(all_max_delta_pesq)
+        summary = {
+            "global_max_abs_delta_pesq": round(global_max, 6),
+        }
+
+    return comparison, summary
+
+
+# ============================================================================
+# Section 5: Mode handlers (main loops)
+# ============================================================================
+
+def run_fullseq(args):
+    """Handler for 'fullseq' subcommand."""
+    from src.stft import mag_pha_stft, mag_pha_istft  # noqa: F401
+    from src.utils import load_model, load_checkpoint, get_stft_args_from_config
+
+    output_dir = Path(args.output_dir)
+    seed_tag = args.exp_pattern.replace("*", "").strip("_")
+    split_tag = f"_part{args.split.split('/')[0]}" if args.split else ""
+
+    logger = setup_logging(output_dir)
+
+    # Find experiments
+    base_dir = Path(args.exp_dir)
+    experiments = find_experiments(base_dir, exp_pattern=args.exp_pattern, split=args.split)
+    if not experiments:
+        logger.error(f"No experiment directories found matching {args.exp_pattern} in {base_dir}")
+        return
+
+    logger.info(f"Found {len(experiments)} experiments to evaluate")
+
+    # Load dataset once
+    logger.info("Loading VoiceBank-DEMAND test set...")
+    hf_dataset = load_test_dataset()
+    logger.info(f"Test set loaded: {len(hf_dataset)} utterances")
+
+    # Evaluate each experiment
+    all_results = {}
+
+    for exp_name, exp_dir in experiments:
+        logger.info(bold(f"\n{'='*60}"))
+        logger.info(bold(f"Evaluating: {exp_name}"))
+        logger.info(bold(f"{'='*60}"))
+
+        try:
+            best_info = find_best_checkpoint(exp_dir)
+            best_step = best_info["step"]
+            chkpt_file = f"model_{best_step}.th"
+            logger.info(f"Best model: step={best_step}, valid_pesq={best_info['valid_pesq']:.4f}")
+
+            chkpt_path = exp_dir / chkpt_file
+            if not chkpt_path.exists():
+                logger.error(f"Checkpoint file not found: {chkpt_path}")
+                continue
+
+            config_path = exp_dir / ".hydra" / "config.yaml"
+            if not config_path.exists():
+                logger.error(f"Config file not found: {config_path}")
+                continue
+
+            conf = OmegaConf.load(config_path)
+            ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
+
+            stft_args = get_stft_args_from_config(conf.model)
+            model = load_model(conf.model, args.device)
+            model = load_checkpoint(model, str(exp_dir), chkpt_file, args.device)
+
+            metrics = evaluate_fullseq_single(model, ev_loader, stft_args, args.device, logger)
+
+            all_results[exp_name] = {
+                "best_step": best_step,
+                "valid_pesq": best_info["valid_pesq"],
+                "test_metrics": metrics,
+            }
+
+            logger.info(
+                bold(f"Results: PESQ={metrics['pesq']:.4f}, STOI={metrics['stoi']:.4f}, "
+                     f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
+                     f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
+            )
+
+            del model
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Failed to evaluate {exp_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if not all_results:
+        logger.error("No experiments were successfully evaluated.")
+        return
+
+    # JSON output
+    json_path = output_dir / f"eval_results_{seed_tag}{split_tag}.json"
+    with open(json_path, "w") as f:
+        json.dump(all_results, f, indent=2)
+    logger.info(f"Results saved to {json_path}")
+
+    # Print summary table
+    logger.info(bold(f"\n{'='*80}"))
+    logger.info(bold("SUMMARY"))
+    logger.info(bold(f"{'='*80}"))
+    header = f"{'Experiment':<25} {'Step':>7} {'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7}"
+    logger.info(header)
+    logger.info("-" * 80)
+    for exp_name, result in all_results.items():
+        m = result["test_metrics"]
+        logger.info(
+            f"{exp_name:<25} {result['best_step']:>7} "
+            f"{m['pesq']:>7.4f} {m['stoi']:>7.4f} {m['csig']:>7.4f} "
+            f"{m['cbak']:>7.4f} {m['covl']:>7.4f}"
+        )
+
+
+def run_streaming(args):
+    """Handler for 'streaming' subcommand."""
+    from src.models.streaming.dublonet import DuBLoNet
+
+    output_dir = Path(args.output_dir)
+    seed_tag = args.exp_pattern.replace("*", "").strip("_")
+    split_tag = f"_part{args.split.split('/')[0]}" if args.split else ""
+
+    logger = setup_logging(output_dir)
+
+    # Find experiments
+    base_dir = Path(args.exp_dir)
+    experiments = find_experiments(base_dir, exp_pattern=args.exp_pattern, split=args.split)
+    if not experiments:
+        logger.error(f"No experiment directories found matching {args.exp_pattern} in {base_dir}")
+        return
+
+    logger.info(f"Found {len(experiments)} experiments to evaluate")
+
+    # Load dataset once
+    logger.info("Loading VoiceBank-DEMAND test set...")
+    hf_dataset = load_test_dataset()
+    logger.info(f"Test set loaded: {len(hf_dataset)} utterances")
+
+    # Evaluate each experiment
+    all_results = {}
+
+    for exp_name, exp_dir in experiments:
+        logger.info(bold(f"\n{'='*60}"))
+        logger.info(bold(f"Evaluating: {exp_name}"))
+        logger.info(bold(f"{'='*60}"))
+
+        try:
+            best_info = find_best_checkpoint(exp_dir)
+            best_step = best_info["step"]
+            chkpt_file = f"model_{best_step}.th"
+            logger.info(f"Best model: step={best_step}, valid_pesq={best_info['valid_pesq']:.4f}")
+
+            chkpt_path = exp_dir / chkpt_file
+            if not chkpt_path.exists():
+                logger.error(f"Checkpoint file not found: {chkpt_path}")
+                continue
+
+            config_path = exp_dir / ".hydra" / "config.yaml"
+            if not config_path.exists():
+                logger.error(f"Config file not found: {config_path}")
+                continue
+
+            conf = OmegaConf.load(config_path)
+
+            la = compute_streaming_lookahead(conf, stft_la=args.stft_lookahead)
+            logger.info(f"  Padding ratio: enc={la['enc_ratio']}, dec={la['dec_ratio']}")
+            logger.info(f"  Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, stft={la['stft_la']}, total={la['total_la']}")
+            logger.info(f"  Latency: {la['latency_ms']:.2f}ms, chunk_size: {args.chunk_size}")
+
+            ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
+
+            streaming = DuBLoNet.from_checkpoint(
+                chkpt_dir=str(exp_dir),
+                chkpt_file=chkpt_file,
+                chunk_size=args.chunk_size,
+                encoder_lookahead=la["enc_la"],
+                decoder_lookahead=la["dec_la"],
+                stft_lookahead_frames=la["stft_la"],
+                device=args.device,
+                verbose=False,
+            )
+
+            metrics = evaluate_streaming_single(streaming, ev_loader, args.device, logger)
+
+            all_results[exp_name] = {
+                "best_step": best_step,
+                "valid_pesq": best_info["valid_pesq"],
+                "chunk_size": args.chunk_size,
+                "stft_lookahead": la["stft_la"],
+                "encoder_lookahead": la["enc_la"],
+                "decoder_lookahead": la["dec_la"],
+                "latency_ms": la["latency_ms"],
+                "test_metrics": metrics,
+            }
+
+            logger.info(
+                bold(f"Results: PESQ={metrics['pesq']:.4f}, STOI={metrics['stoi']:.4f}, "
+                     f"CSIG={metrics['csig']:.4f}, CBAK={metrics['cbak']:.4f}, "
+                     f"COVL={metrics['covl']:.4f}, segSNR={metrics['segSNR']:.4f}")
+            )
+
+            del streaming
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Failed to evaluate {exp_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if not all_results:
+        logger.error("No experiments were successfully evaluated.")
+        return
+
+    # Auto-compare with full-seq results if available
+    fullseq_json_path = output_dir / f"eval_results_{seed_tag}.json"
+    comparison = generate_streaming_comparison(all_results, fullseq_json_path, logger)
+
+    # JSON output (with comparison embedded)
+    output_json = dict(all_results)
+    if comparison:
+        output_json["_comparison"] = comparison
+    json_path = output_dir / f"eval_results_streaming_{seed_tag}{split_tag}.json"
+    with open(json_path, "w") as f:
+        json.dump(output_json, f, indent=2)
+    logger.info(f"Results saved to {json_path}")
+
+    # Print summary table
+    logger.info(bold(f"\n{'='*80}"))
+    logger.info(bold("SUMMARY"))
+    logger.info(bold(f"{'='*80}"))
+    header = f"{'Experiment':<25} {'Step':>7} {'Lat(ms)':>8} {'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7}"
+    logger.info(header)
+    logger.info("-" * 80)
+    for exp_name, result in all_results.items():
+        m = result["test_metrics"]
+        logger.info(
+            f"{exp_name:<25} {result['best_step']:>7} "
+            f"{result['latency_ms']:>8.2f} "
+            f"{m['pesq']:>7.4f} {m['stoi']:>7.4f} {m['csig']:>7.4f} "
+            f"{m['cbak']:>7.4f} {m['covl']:>7.4f}"
+        )
+
+
+def run_chunksweep(args):
+    """Handler for 'chunksweep' subcommand."""
+    from src.models.streaming.dublonet import DuBLoNet
+    from src.models.streaming.utils import prepare_streaming_model
+
+    output_dir = Path(args.output_dir)
+    logger = setup_logging(output_dir)
+
+    logger.info(f"Experiments: {args.experiments}")
+    logger.info(f"Chunk sizes: {args.chunk_sizes}")
+    logger.info(f"Device: {args.device}")
+
+    # Find experiments
+    base_dir = Path(args.exp_dir)
+    experiments = find_experiments(base_dir, exp_names=args.experiments)
+    if not experiments:
+        logger.error("No valid experiment directories found.")
+        return
+
+    # Load dataset once
+    logger.info("Loading VoiceBank-DEMAND test set...")
+    hf_dataset = load_test_dataset()
+    logger.info(f"Test set loaded: {len(hf_dataset)} utterances")
+
+    # Main loop: experiments (outer) x chunk_sizes (inner)
+    all_results = {}
+
+    for exp_name, exp_dir in experiments:
+        logger.info(bold(f"\n{'='*60}"))
+        logger.info(bold(f"Evaluating: {exp_name}"))
+        logger.info(bold(f"{'='*60}"))
+
+        try:
+            best_info = find_best_checkpoint(exp_dir)
+            best_step = best_info["step"]
+            chkpt_file = f"model_{best_step}.th"
+            logger.info(f"  Model loaded (step={best_step}, valid_pesq={best_info['valid_pesq']:.4f})")
+
+            chkpt_path = exp_dir / chkpt_file
+            if not chkpt_path.exists():
+                logger.error(f"  Checkpoint file not found: {chkpt_path}")
+                continue
+
+            config_path = exp_dir / ".hydra" / "config.yaml"
+            if not config_path.exists():
+                logger.error(f"  Config file not found: {config_path}")
+                continue
+
+            conf = OmegaConf.load(config_path)
+
+            la = compute_streaming_lookahead(conf, stft_la=args.stft_lookahead)
+            sample_rate = la["sample_rate"]
+            logger.info(f"  Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, stft={la['stft_la']}, total={la['total_la']}")
+            logger.info(f"  Latency: {la['latency_ms']:.2f}ms")
+
+            ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
+
+            # Load model ONCE per experiment
+            model, metadata = prepare_streaming_model(
+                chkpt_dir=str(exp_dir),
+                chkpt_file=chkpt_file,
+                use_stateful_conv=True,
+                device=args.device,
+                verbose=False,
+            )
+            model_args = metadata["model_args"]
+
+            stft_hop = getattr(model_args, "hop_size", 100)
+            stft_nfft = getattr(model_args, "n_fft", 400)
+            stft_win = getattr(model_args, "win_size", 400)
+            stft_compress = getattr(model_args, "compress_factor", 0.3)
+            freq_size = stft_nfft // 2 + 1
+
+            # Sweep chunk_sizes
+            chunk_results = {}
+
+            for cs in args.chunk_sizes:
+                dublonet = DuBLoNet(
+                    model=model,
+                    chunk_size=cs,
+                    encoder_lookahead=la["enc_la"],
+                    decoder_lookahead=la["dec_la"],
+                    stft_lookahead_frames=la["stft_la"],
+                    hop_size=stft_hop,
+                    n_fft=stft_nfft,
+                    win_size=stft_win,
+                    compress_factor=stft_compress,
+                    sample_rate=sample_rate,
+                    freq_size=freq_size,
+                )
+
+                metrics = evaluate_streaming_single(dublonet, ev_loader, args.device, logger)
+
+                logger.info(
+                    f"  [chunk_size={cs:>3}] "
+                    f"PESQ={metrics['pesq']:.4f} STOI={metrics['stoi']:.4f} "
+                    f"CSIG={metrics['csig']:.4f} CBAK={metrics['cbak']:.4f} "
+                    f"COVL={metrics['covl']:.4f} segSNR={metrics['segSNR']:.4f}"
+                )
+
+                chunk_results[str(cs)] = metrics
+                del dublonet
+
+            all_results[exp_name] = {
+                "best_step": best_step,
+                "stft_lookahead": la["stft_la"],
+                "encoder_lookahead": la["enc_la"],
+                "decoder_lookahead": la["dec_la"],
+                "latency_ms": la["latency_ms"],
+                "chunk_results": chunk_results,
+            }
+
+            del model
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Failed to evaluate {exp_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if not all_results:
+        logger.error("No experiments were successfully evaluated.")
+        return
+
+    # Comparison vs full-sequence
+    first_exp = args.experiments[0]
+    seed_tag = ""
+    for part in first_exp.split("_"):
+        if part.startswith("s") and part[1:].isdigit():
+            seed_tag = part
+            break
+
+    fullseq_path = output_dir / f"eval_results_{seed_tag}.json" if seed_tag else None
+    comparison, summary = None, None
+    if fullseq_path:
+        comparison, summary = build_chunksweep_comparison(all_results, fullseq_path, logger)
+
+    # Build output JSON
+    output_json = dict(all_results)
+    if comparison is not None:
+        output_json["_comparison"] = comparison
+    if summary is not None:
+        output_json["_summary"] = summary
+
+    json_path = output_dir / "eval_results_chunksweep.json"
+    with open(json_path, "w") as f:
+        json.dump(output_json, f, indent=2)
+    logger.info(f"Results saved to {json_path}")
+
+    # Print summary table
+    logger.info(bold(f"\n{'='*90}"))
+    logger.info(bold("SUMMARY"))
+    logger.info(bold(f"{'='*90}"))
+    header = (
+        f"{'Experiment':<25} {'Lat(ms)':>8} {'CS':>5} "
+        f"{'PESQ':>7} {'STOI':>7} {'CSIG':>7} {'CBAK':>7} {'COVL':>7} "
+        f"{'δPESQ':>9}"
+    )
+    logger.info(header)
+    logger.info("-" * 90)
+
+    for exp_name, exp_data in all_results.items():
+        for cs_str, metrics in exp_data["chunk_results"].items():
+            delta_str = ""
+            if comparison and exp_name in comparison:
+                chunk_deltas = comparison[exp_name]["chunk_deltas"]
+                if cs_str in chunk_deltas:
+                    d = chunk_deltas[cs_str]["delta_pesq"]
+                    delta_str = f"{d:+.6f}"
+            logger.info(
+                f"{exp_name:<25} {exp_data['latency_ms']:>8.2f} {cs_str:>5} "
+                f"{metrics['pesq']:>7.4f} {metrics['stoi']:>7.4f} "
+                f"{metrics['csig']:>7.4f} {metrics['cbak']:>7.4f} "
+                f"{metrics['covl']:>7.4f} {delta_str:>9}"
+            )
+
+    # Cross-chunk consistency
+    logger.info("")
+    logger.info(bold("Cross-chunk consistency (within each experiment):"))
+    for exp_name, exp_data in all_results.items():
+        pesq_vals = [m["pesq"] for m in exp_data["chunk_results"].values()]
+        max_spread = max(pesq_vals) - min(pesq_vals)
+        logger.info(f"  {exp_name}: max PESQ spread = {max_spread:.6f}")
+
+    if summary:
+        logger.info("")
+        logger.info(bold(f"Global max |δPESQ| vs full-seq: {summary['global_max_abs_delta_pesq']:.6f}"))
+
+
+# ============================================================================
+# Section 6: Argument parser + dispatch
+# ============================================================================
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Unified batch evaluation for DuBLoNet experiments",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  %(prog)s fullseq --exp_pattern "*s2039" --device cuda
+  %(prog)s streaming --exp_pattern "*s2039" --chunk_size 1 --device cuda
+  %(prog)s chunksweep --experiments M1_6.25ms_s2039 --chunk_sizes 1 64 --device cuda
+""",
+    )
+
+    # Parent parser with common arguments
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--exp_dir", type=str, default="results/experiments",
+                        help="Base directory containing experiment directories.")
+    parent.add_argument("--output_dir", type=str, default="results/evaluation",
+                        help="Directory to save evaluation results.")
+    parent.add_argument("--device", type=str,
+                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parent.add_argument("--num_workers", type=int, default=5)
+
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    # --- fullseq ---
+    p_full = subparsers.add_parser(
+        "fullseq", parents=[parent],
+        help="Full-sequence (non-streaming) evaluation",
+    )
+    p_full.add_argument("--exp_pattern", type=str, default="*s2039",
+                        help="Glob pattern to match experiment directories.")
+    p_full.add_argument("--split", type=str, default=None,
+                        help="Split experiments: 'INDEX/TOTAL' (e.g., '0/2')")
+    p_full.set_defaults(func=run_fullseq)
+
+    # --- streaming ---
+    p_stream = subparsers.add_parser(
+        "streaming", parents=[parent],
+        help="Streaming evaluation (single chunk_size)",
+    )
+    p_stream.add_argument("--exp_pattern", type=str, default="*s2039",
+                          help="Glob pattern to match experiment directories.")
+    p_stream.add_argument("--chunk_size", type=int, default=1,
+                          help="DuBLoNet chunk size in STFT frames.")
+    p_stream.add_argument("--stft_lookahead", type=int, default=1,
+                          help="STFT lookahead frames. Increase (e.g., 2) for small chunk sizes.")
+    p_stream.add_argument("--split", type=str, default=None,
+                          help="Split experiments: 'INDEX/TOTAL' (e.g., '0/2')")
+    p_stream.set_defaults(func=run_streaming)
+
+    # --- chunksweep ---
+    p_sweep = subparsers.add_parser(
+        "chunksweep", parents=[parent],
+        help="Chunk-size sweep across multiple chunk_sizes",
+    )
+    p_sweep.add_argument("--experiments", type=str, nargs="+", required=True,
+                         help="Experiment directory names to evaluate.")
+    p_sweep.add_argument("--chunk_sizes", type=int, nargs="+",
+                         default=[1, 4, 16, 64, 160],
+                         help="Chunk sizes (STFT frames) to sweep.")
+    p_sweep.add_argument("--stft_lookahead", type=int, default=1,
+                         help="STFT lookahead frames. Increase (e.g., 2) for small chunk sizes.")
+    p_sweep.set_defaults(func=run_chunksweep)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

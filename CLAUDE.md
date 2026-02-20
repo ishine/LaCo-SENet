@@ -66,10 +66,23 @@ python -m src.enhance --chkpt_dir <exp_dir> --use_stateful_conv
 
 ## 문서 구성 (paper_works/)
 
+### 논문 원고 (주 작업 문서)
+
+| 파일 | 내용 |
+|------|------|
+| `interspeech2026/paper.tex` | **Interspeech 2026 논문 원고 (LaTeX)** — 모든 논문 편집은 이 파일 기준 |
+| `interspeech2026/mybib.bib` | BibTeX 참고문헌 |
+| `interspeech2026/Interspeech.cls` | Interspeech 2026 LaTeX 클래스 파일 |
+
+### 참고 자료 (markdown)
+
 | 파일 | 내용 |
 |------|------|
 | `experiment_design.md` | 실험 설계서: latency sweep, padding ratio 매핑, 학습 config matrix, 논문 Figure/Table 구상 |
 | `benchmark_comparison.md` | 벤치마크 모델(RNNoise, GaGNet, SEMamba 등) 대비 latency/성능 비교표 |
+| `dublonet_architecture.md` | DuBLoNet 아키텍처 상세 기술 문서 (코드 기반 분석) |
+| `results.md` | 학습 실험 결과 기록 |
+| `todo_exp_list.md` | 실험 TODO 목록 |
 | `references.md` | 관련 논문 레퍼런스 목록 |
 | `dns3_training_recipes.md` | DNS Challenge 3 학습 레시피 참고 자료 |
 
