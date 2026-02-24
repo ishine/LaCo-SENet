@@ -337,6 +337,7 @@ class DuBLoNet(nn.Module):
         encoder_lookahead: int = 0,
         decoder_lookahead: int = 7,
         use_reshape_free: bool = False,
+        fold_bn: bool = False,
         device: Optional[str] = None,
         verbose: bool = True,
     ) -> "DuBLoNet":
@@ -365,6 +366,7 @@ class DuBLoNet(nn.Module):
                 - Unifies batch dimension to B=1 for all states
                 - Reduces state count by ~48% (100 -> 52)
                 - Recommended for NPU deployment
+            fold_bn: Apply BN folding for CPU inference.
             device: Device to load model on
             verbose: Print loading information
 
@@ -387,6 +389,7 @@ class DuBLoNet(nn.Module):
             chkpt_file=chkpt_file,
             use_stateful_conv=True,  # Always use stateful conv for buffered streaming
             use_reshape_free=use_reshape_free,
+            fold_bn=fold_bn,
             device=device,
             verbose=verbose,
         )
@@ -413,8 +416,12 @@ class DuBLoNet(nn.Module):
         compress_factor = getattr(model_params, 'compress_factor', 0.3)
         stft_center = getattr(model_params, 'stft_center', True)
 
-        # Calculate freq_size for state initialization
-        freq_size = n_fft // 2 + 1  # Default to STFT frequency bins
+        # Calculate freq_size from actual encoder output (not STFT bins)
+        # DenseEncoder's dense_conv_2 has stride=(1,2), halving freq dimension
+        stft_freq = n_fft // 2 + 1
+        with torch.no_grad():
+            dummy = torch.randn(1, 2, 4, stft_freq, device=next(model.parameters()).device)
+            freq_size = model.dense_encoder(dummy).shape[3]
 
         # Create instance
         instance = cls(
@@ -696,17 +703,16 @@ class DuBLoNet(nn.Module):
             Tuple of (est_mag, est_pha) if output available, None otherwise
             Output time dimension is chunk_size (for cross-chunk OLA)
         """
-        with torch.no_grad():
-            # Step 1: Encoder + TS_BLOCK (common path)
-            mag, ts_out, valid_frames = self._process_encoder(spectrogram)
+        # Step 1: Encoder + TS_BLOCK (common path)
+        mag, ts_out, valid_frames = self._process_encoder(spectrogram)
 
-            # Step 2: Decoder path (conditional)
-            if self._can_process_immediately(ts_out):
-                # Immediate mode: Use encoder output directly for decoder
-                return self._process_decoder_immediate(ts_out, mag)
-            else:
-                # Buffered mode: Accumulate features and wait for lookahead
-                return self._process_decoder_buffered(ts_out, mag, valid_frames)
+        # Step 2: Decoder path (conditional)
+        if self._can_process_immediately(ts_out):
+            # Immediate mode: Use encoder output directly for decoder
+            return self._process_decoder_immediate(ts_out, mag)
+        else:
+            # Buffered mode: Accumulate features and wait for lookahead
+            return self._process_decoder_buffered(ts_out, mag, valid_frames)
 
     def _manual_istft_ola(self, est_mag: Tensor, est_pha: Tensor) -> Tensor:
         """
@@ -744,6 +750,7 @@ class DuBLoNet(nn.Module):
 
         return output[:self.output_samples_per_chunk]
 
+    @torch.inference_mode()
     def process_samples(self, samples: Tensor) -> Optional[Tensor]:
         """
         Process incoming audio samples and return enhanced output if available.

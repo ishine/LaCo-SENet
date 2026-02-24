@@ -232,6 +232,7 @@ class ModelPrepConfig:
 
     use_stateful_conv: bool = True
     use_reshape_free: bool = False
+    fold_bn: bool = False
 
     device: Optional[str] = None
     verbose: bool = True
@@ -388,8 +389,10 @@ def prepare_streaming_model(
 
     This is the main entry point that combines all preparation steps:
     1. Load model from checkpoint
-    2. Optionally convert TS_BLOCKs to reshape-free versions
-    3. Convert to Stateful Convolutions
+    2. BN Folding (if fold_bn)
+    3. Optionally convert TS_BLOCKs to reshape-free versions
+    4. Convert to Stateful Convolutions
+    5. Channels-last + torch.compile (if fold_bn)
 
     Args:
         chkpt_dir: Checkpoint directory path
@@ -416,6 +419,7 @@ def prepare_streaming_model(
         valid_fields = {
             "use_stateful_conv",
             "use_reshape_free",
+            "fold_bn",
             "device",
             "verbose",
         }
@@ -440,7 +444,16 @@ def prepare_streaming_model(
         chkpt_dir, chkpt_file, device, config.verbose
     )
 
-    # Step 2: Apply Reshape-Free TS_BLOCK (if enabled)
+    # Step 2: BN Folding (before structural transforms preserve Sequential structure)
+    bn_fused = 0
+    if config.fold_bn:
+        from src.models.streaming.cpu_optimizations import fold_batchnorm
+
+        model, bn_fused = fold_batchnorm(model)
+        if config.verbose:
+            print(f"  BN Folding: {bn_fused} pairs fused")
+
+    # Step 3: Apply Reshape-Free TS_BLOCK (if enabled)
     rf_sequence_block = None
     rf_block_count = 0
     if config.use_reshape_free:
@@ -449,10 +462,16 @@ def prepare_streaming_model(
             verbose=config.verbose,
         )
 
-    # Step 3: Apply Stateful Conv (for encoder/decoder)
+    # Step 4: Apply Stateful Conv (for encoder/decoder)
     stateful_count = 0
     if config.use_stateful_conv:
         model, stateful_count = apply_stateful_conv(model, device, config.verbose)
+
+    cpu_stats = {}
+    if config.fold_bn:
+        cpu_stats = {
+            "bn_fused": bn_fused,
+        }
 
     # Build metadata
     metadata: Dict[str, Any] = {
@@ -462,6 +481,8 @@ def prepare_streaming_model(
         "use_reshape_free": config.use_reshape_free,
         "rf_sequence_block": rf_sequence_block,
         "rf_block_count": rf_block_count,
+        "fold_bn": config.fold_bn,
+        "cpu_stats": cpu_stats,
         "model_args": model_args,
     }
 
