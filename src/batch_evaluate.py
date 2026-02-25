@@ -10,7 +10,7 @@ Three subcommands cover all evaluation modes:
 Usage:
     python -m src.batch_evaluate fullseq --exp_pattern "*s2039" --device cuda
     python -m src.batch_evaluate streaming --exp_pattern "*s2039" --chunk_size 1 --device cuda
-    python -m src.batch_evaluate chunksweep --experiments M1_6.25ms_s2039 --chunk_sizes 1 64 --device cuda
+    python -m src.batch_evaluate chunksweep --experiments M1_12.5ms_s2039 --chunk_sizes 1 64 --device cuda
 
     # Split across 2 GPUs (fullseq / streaming):
     python -m src.batch_evaluate fullseq --exp_pattern "*s2039" --device cuda:0 --split 0/2 &
@@ -33,7 +33,7 @@ from datasets import load_dataset
 
 from src.compute_metrics import compute_metrics
 from src.data import VoiceBankDataset
-from src.utils import bold
+from src.utils import bold, compute_lookahead_frames
 
 METRICS_LIST = ["pesq", "stoi", "csig", "cbak", "covl", "segSNR"]
 
@@ -58,27 +58,6 @@ def find_best_checkpoint(exp_dir: Path) -> dict:
         "step": best["steps"],
         "valid_pesq": best["valid_pesq_value"],
     }
-
-
-def compute_right_frames(padding_ratio, depth=4):
-    """
-    Compute total right padding frames from padding_ratio for DS_DDB.
-
-    DS_DDB: depth=4, kernel_size=3, dilations=[1,2,4,8].
-    Each layer: time_padding_total = 2 * dilation.
-    Matches AsymmetricConv2d rounding logic (Python banker's rounding).
-    """
-    left_ratio, right_ratio = padding_ratio
-    total_right = 0
-    for i in range(depth):
-        dilation = 2 ** i
-        time_padding_total = dilation * 2
-        left = round(time_padding_total * left_ratio)
-        right = round(time_padding_total * right_ratio)
-        if left + right != time_padding_total:
-            right = time_padding_total - left
-        total_right += right
-    return total_right
 
 
 def setup_logging(output_dir):
@@ -153,12 +132,13 @@ def find_experiments(base_dir, exp_pattern=None, exp_names=None, split=None):
 def compute_streaming_lookahead(conf, chunk_size: int):
     """Compute streaming lookahead info from model config.
 
-    Returns dict with enc_la, dec_la, total_la, latency_ms, hop_size, sample_rate.
+    Returns dict with encoder_lookahead, decoder_lookahead, total_lookahead,
+    latency_ms, hop_size, sample_rate, etc.
     """
     enc_ratio = list(conf.model.encoder_padding_ratio)
     dec_ratio = list(conf.model.decoder_padding_ratio)
-    enc_la = compute_right_frames(enc_ratio)
-    dec_la = compute_right_frames(dec_ratio)
+    enc_la = compute_lookahead_frames(enc_ratio)
+    dec_la = compute_lookahead_frames(dec_ratio)
 
     # Match DuBLoNet streaming wrapper behavior:
     # - input_lookahead_frames = encoder lookahead (no min-2-frame hack needed)
@@ -179,10 +159,10 @@ def compute_streaming_lookahead(conf, chunk_size: int):
     return {
         "enc_ratio": enc_ratio,
         "dec_ratio": dec_ratio,
-        "enc_la": enc_la,
-        "dec_la": dec_la,
-        "input_la": input_la,
-        "total_la": total_la,
+        "encoder_lookahead": enc_la,
+        "decoder_lookahead": dec_la,
+        "input_lookahead": input_la,
+        "total_lookahead": total_la,
         "latency_ms": latency_ms,
         "hop_size": hop_size,
         "win_size": win_size,
@@ -537,7 +517,7 @@ def run_streaming(args):
 
             la = compute_streaming_lookahead(conf, chunk_size=args.chunk_size)
             logger.info(f"  Padding ratio: enc={la['enc_ratio']}, dec={la['dec_ratio']}")
-            logger.info(f"  Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, total={la['total_la']}")
+            logger.info(f"  Lookahead: enc={la['encoder_lookahead']}, dec={la['decoder_lookahead']}, total={la['total_lookahead']}")
             logger.info(f"  Latency: {la['latency_ms']:.2f}ms, chunk_size: {args.chunk_size}")
 
             ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
@@ -546,8 +526,8 @@ def run_streaming(args):
                 chkpt_dir=str(exp_dir),
                 chkpt_file=chkpt_file,
                 chunk_size=args.chunk_size,
-                encoder_lookahead=la["enc_la"],
-                decoder_lookahead=la["dec_la"],
+                encoder_lookahead=la["encoder_lookahead"],
+                decoder_lookahead=la["decoder_lookahead"],
                 device=args.device,
                 verbose=False,
             )
@@ -562,8 +542,8 @@ def run_streaming(args):
                 "best_step": best_step,
                 "valid_pesq": best_info["valid_pesq"],
                 "chunk_size": args.chunk_size,
-                "encoder_lookahead": la["enc_la"],
-                "decoder_lookahead": la["dec_la"],
+                "encoder_lookahead": la["encoder_lookahead"],
+                "decoder_lookahead": la["decoder_lookahead"],
                 "latency_ms": la["latency_ms"],
                 "align_ola": align_ola,
                 "shift_samples": shift_samples,
@@ -680,29 +660,29 @@ def run_chunksweep(args):
             )
             model_args = metadata["model_args"]
 
-            stft_hop = getattr(model_args, "hop_size", 100)
-            stft_nfft = getattr(model_args, "n_fft", 400)
-            stft_win = getattr(model_args, "win_size", 400)
-            stft_compress = getattr(model_args, "compress_factor", 0.3)
-            freq_size = stft_nfft // 2 + 1
+            hop_size = getattr(model_args, "hop_size", 100)
+            n_fft = getattr(model_args, "n_fft", 400)
+            win_size = getattr(model_args, "win_size", 400)
+            compress_factor = getattr(model_args, "compress_factor", 0.3)
+            freq_size = n_fft // 2 + 1
 
             # Sweep chunk_sizes
             chunk_results = {}
 
             for cs in args.chunk_sizes:
                 la = compute_streaming_lookahead(conf, chunk_size=cs)
-                logger.info(f"  [cs={cs}] Lookahead: enc={la['enc_la']}, dec={la['dec_la']}, "
-                            f"total={la['total_la']}, latency={la['latency_ms']:.2f}ms")
+                logger.info(f"  [cs={cs}] Lookahead: enc={la['encoder_lookahead']}, dec={la['decoder_lookahead']}, "
+                            f"total={la['total_lookahead']}, latency={la['latency_ms']:.2f}ms")
 
                 dublonet = DuBLoNet(
                     model=model,
                     chunk_size=cs,
-                    encoder_lookahead=la["enc_la"],
-                    decoder_lookahead=la["dec_la"],
-                    hop_size=stft_hop,
-                    n_fft=stft_nfft,
-                    win_size=stft_win,
-                    compress_factor=stft_compress,
+                    encoder_lookahead=la["encoder_lookahead"],
+                    decoder_lookahead=la["decoder_lookahead"],
+                    hop_size=hop_size,
+                    n_fft=n_fft,
+                    win_size=win_size,
+                    compress_factor=compress_factor,
                     sample_rate=sample_rate,
                     freq_size=freq_size,
                     stft_center=la["stft_center"],
@@ -726,8 +706,8 @@ def run_chunksweep(args):
 
             all_results[exp_name] = {
                 "best_step": best_step,
-                "encoder_lookahead": la["enc_la"],
-                "decoder_lookahead": la["dec_la"],
+                "encoder_lookahead": la["encoder_lookahead"],
+                "decoder_lookahead": la["decoder_lookahead"],
                 "latency_ms": la["latency_ms"],
                 "chunk_results": chunk_results,
             }
@@ -822,7 +802,7 @@ def build_parser():
 examples:
   %(prog)s fullseq --exp_pattern "*s2039" --device cuda
   %(prog)s streaming --exp_pattern "*s2039" --chunk_size 1 --device cuda
-  %(prog)s chunksweep --experiments M1_6.25ms_s2039 --chunk_sizes 1 64 --device cuda
+  %(prog)s chunksweep --experiments M1_12.5ms_s2039 --chunk_sizes 1 64 --device cuda
 """,
     )
 

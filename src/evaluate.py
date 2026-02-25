@@ -101,7 +101,7 @@ if __name__=="__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_config", type=str, required=True, help="Path to the model config file.")
     parser.add_argument("--chkpt_dir", type=str, default='.', help="Path to the checkpoint directory.")
-    parser.add_argument("--chkpt_file", type=str, default="best.th", help="Checkpoint file name.")
+    parser.add_argument("--chkpt_file", type=str, required=True, help="Checkpoint file name.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu).")
     parser.add_argument("--num_workers", type=int, default=5, help="Number of workers.")
     parser.add_argument("--log_file", type=str, default="output.log", help="Log file name.")

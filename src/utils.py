@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import logging
 import re
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Tuple, Union, Any
 from joblib import Parallel, delayed
 from contextlib import contextmanager
 import atexit
@@ -343,3 +343,47 @@ def get_stft_args_from_config(model_args) -> Dict[str, Any]:
         "compress_factor": model_args.get("compress_factor", 1.0),
         "center": model_args.get("stft_center", True),
     }
+
+
+def compute_lookahead_frames(padding_ratio, depth=4) -> int:
+    """Compute total right (future) padding frames for a DS_DDB block.
+
+    DS_DDB uses depth layers with kernel_size=3 and dilations=[1,2,4,8].
+    Each layer: time_padding_total = 2 * dilation.
+    Matches AsymmetricConv2d rounding logic (Python banker's rounding).
+
+    Args:
+        padding_ratio: (left_ratio, right_ratio) tuple that sums to 1.0
+        depth: Number of dilated layers (default: 4)
+
+    Returns:
+        Total right padding frames (lookahead requirement)
+    """
+    left_ratio, right_ratio = padding_ratio
+    total_right = 0
+    for i in range(depth):
+        dilation = 2 ** i
+        time_padding_total = dilation * 2
+        left = round(time_padding_total * left_ratio)
+        right = round(time_padding_total * right_ratio)
+        if left + right != time_padding_total:
+            right = time_padding_total - left
+        total_right += right
+    return total_right
+
+
+def compute_lookahead_from_config(model_config) -> Tuple[int, int]:
+    """Compute encoder/decoder lookahead frames from model config.
+
+    Args:
+        model_config: OmegaConf model config node (or object with attrs)
+
+    Returns:
+        (encoder_lookahead, decoder_lookahead) in frames
+    """
+    depth = getattr(model_config, 'dense_depth', 4)
+    enc_ratio = list(getattr(model_config, 'encoder_padding_ratio', [0.5, 0.5]))
+    dec_ratio = list(getattr(model_config, 'decoder_padding_ratio', [0.5, 0.5]))
+    enc_la = compute_lookahead_frames(enc_ratio, depth)
+    dec_la = compute_lookahead_frames(dec_ratio, depth)
+    return enc_la, dec_la

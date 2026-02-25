@@ -11,13 +11,15 @@ DuBLoNet 음성 향상(speech enhancement) 모델에 대한 학회 논문 작성
 ## 코드베이스 구성
 
 ```
-dublonet/
+DuBLoNet/
 ├── conf/
 │   └── config.yaml              # Hydra 학습 설정 (모델, 데이터셋, 손실함수, 최적화)
 ├── src/
 │   ├── train.py                 # 학습 엔트리포인트 (Hydra)
 │   ├── evaluate.py              # 평가 스크립트 (PESQ/STOI 등 메트릭 산출)
+│   ├── batch_evaluate.py        # 배치 평가 스크립트 (여러 실험 일괄 평가)
 │   ├── enhance.py               # 음성 향상 및 wav 저장 (streaming 옵션 포함)
+│   ├── measure_rtf.py           # Real-Time Factor 측정 스크립트
 │   ├── solver.py                # 학습 루프 (MetricGAN discriminator 포함)
 │   ├── data.py                  # VoiceBankDataset, 세그먼트 샘플링
 │   ├── stft.py                  # mag-phase STFT/iSTFT 유틸리티
@@ -26,16 +28,32 @@ dublonet/
 │   ├── receptive_field.py       # 수용장(receptive field) 계산기
 │   ├── utils.py                 # 모델 로드, 체크포인트, 로깅 유틸리티
 │   ├── models/
-│   │   ├── backbone.py         # Backbone 모델 정의 (CausalConv, DenseEncoder, TSBlock 등)
+│   │   ├── backbone.py          # Backbone 모델 정의 (CausalConv, DenseEncoder, TSBlock 등)
 │   │   ├── discriminator.py     # MetricGAN Discriminator
-│   │   └── streaming/           # 스트리밍 추론 관련 모듈
-│   │       ├── layers/          # StatefulConv, ReshapeFree 등 스트리밍 레이어
-│   │       ├── converters/      # 일반 모델 → 스트리밍 모델 변환기 (conv, reshape_free)
-│   │       ├── core/            # 상태 관리, 모델 빌더
-│   │       ├── wrappers/        # DuBLoNet (STFT overlap-add + lookahead buffering)
-│   │       └── onnx/            # ONNX 내보내기용 stateful wrapper
+│   │   ├── streaming/           # 스트리밍 추론 관련 모듈
+│   │   │   ├── layers/          # StatefulConv, ReshapeFree 등 스트리밍 레이어
+│   │   │   ├── converters/      # 일반 모델 → 스트리밍 모델 변환기 (conv, reshape_free)
+│   │   │   ├── dublonet.py      # DuBLoNet wrapper (STFT overlap-add + lookahead buffering)
+│   │   │   ├── utils.py         # 스트리밍 유틸리티 (manual iSTFT, latency 계산 등)
+│   │   │   └── cpu_optimizations.py  # CPU 추론 최적화
+│   │   └── onnx_export/         # ONNX 내보내기용 모듈
+│   │       ├── layers/          # Stateful functional 레이어, ConvTranspose wrapper
+│   │       ├── exportable_core.py
+│   │       ├── stateful_core.py
+│   │       ├── stateful_core_rf.py
+│   │       ├── streaming_wrapper.py
+│   │       ├── state_registry.py
+│   │       └── verify_utils.py
+├── ablation/                    # Ablation study (복잡도 측정 등)
+├── baselines/                   # 베이스라인 모델 비교 (MP-SENet, MUSE, GTCRN 등)
+│   ├── repos/                   # 베이스라인 모델 레포지토리
+│   └── samples/                 # 베이스라인별 향상 오디오 샘플
+├── demo/                        # 데모용 오디오/스펙트로그램
+├── scripts/                     # 유틸리티 스크립트
 ├── results/
-│   └── experiments/             # Hydra 실험 출력 (체크포인트, 로그, TensorBoard)
+│   ├── experiments/             # Hydra 실험 출력 (체크포인트, 로그, TensorBoard)
+│   ├── evaluation/              # 평가 결과
+│   └── rtf/                     # RTF 측정 결과
 ├── paper_works/                 # 논문 작성 관련 문서
 └── requirements.txt             # 의존성 목록
 ```
@@ -78,16 +96,39 @@ python -m src.enhance --chkpt_dir <exp_dir> --use_stateful_conv
 
 | 파일 | 내용 |
 |------|------|
-| `experiment_design.md` | 실험 설계서: latency sweep, padding ratio 매핑, 학습 config matrix, 논문 Figure/Table 구상 |
 | `benchmark_comparison.md` | 벤치마크 모델(RNNoise, GaGNet, SEMamba 등) 대비 latency/성능 비교표 |
+| `benchmark_latency_analysis.md` | 벤치마크 모델 latency 분석 |
 | `dublonet_architecture.md` | DuBLoNet 아키텍처 상세 기술 문서 (코드 기반 분석) |
+| `dublonet_streaming_context.md` | DuBLoNet 스트리밍 컨텍스트 분석 |
+| `algorithmic_latency_definition.md` | Algorithmic latency 정의 및 분석 |
+| `rtf_experiment_design.md` | RTF 실험 설계서 |
 | `results.md` | 학습 실험 결과 기록 |
-| `todo_exp_list.md` | 실험 TODO 목록 |
 | `references.md` | 관련 논문 레퍼런스 목록 |
-| `dns3_training_recipes.md` | DNS Challenge 3 학습 레시피 참고 자료 |
+| `figures/` | 논문 Figure 생성 스크립트 (plot_latency_vs_pesq.py, figure_style_guide.py) |
 
 ## 설정 (conf/config.yaml)
 
 - Hydra 기반 설정 관리, `hydra.run.dir`로 실험별 디렉토리 자동 생성
 - 주요 모델 파라미터: `causal`, `encoder_padding_ratio`, `decoder_padding_ratio`, `norm_type`, `sca_kernel_size`
 - 실험 결과는 `results/experiments/<날짜시간>/`에 저장 (체크포인트, `.hydra/config.yaml`, TensorBoard 로그)
+
+## 코딩 가이드라인 (Karpathy-derived)
+
+### 1. Think Before Coding
+- 가정을 명시적으로 밝힌다. 불확실하면 먼저 질문한다.
+- 여러 해석이 가능하면 선택지를 제시한다 — 임의로 하나를 고르지 않는다.
+- 더 단순한 접근이 존재하면 말한다. 반박이 필요하면 반박한다.
+- 혼란스러우면 멈추고, 무엇이 불명확한지 짚고 질문한다.
+
+### 2. Simplicity First
+- 요청된 것만 구현한다. 투기적 기능, 단일 용도 추상화, 요청되지 않은 "유연성"이나 "설정 가능성"을 추가하지 않는다.
+- 200줄로 작성한 코드가 50줄로 가능하면 다시 쓴다.
+
+### 3. Surgical Changes
+- 요청과 직접 관련된 코드만 수정한다. 인접 코드, 주석, 포맷팅을 "개선"하지 않는다.
+- 깨지지 않은 것을 리팩토링하지 않는다. 기존 스타일을 따른다.
+- 내 변경으로 인해 미사용된 import/변수/함수는 제거한다. 기존 dead code는 요청 없이 건드리지 않는다.
+
+### 4. Goal-Driven Execution
+- 성공 기준을 먼저 정의하고, 검증될 때까지 루프한다.
+- 다단계 작업은 검증 체크포인트가 포함된 간단한 계획을 먼저 제시한다.

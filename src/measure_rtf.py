@@ -20,7 +20,7 @@ Reshape-free and BN folding are always enabled.
 
 Usage:
     python -m src.measure_rtf \\
-        --chkpt_dir results/experiments/M1_6.25ms/s7 \\
+        --chkpt_dir results/experiments/M1_12.5ms/s7 \\
         --chkpt_file model_130000.th
 """
 import sys
@@ -41,7 +41,7 @@ from typing import List, Tuple
 import numpy as np
 import torch
 
-from src.utils import load_model, load_checkpoint
+from src.utils import load_model, load_checkpoint, compute_lookahead_from_config
 
 
 @dataclass
@@ -49,38 +49,6 @@ class RTFResult:
     mean: float
     std: float
     per_repeat: List[float]
-
-
-def compute_lookahead_from_config(model_config) -> Tuple[int, int]:
-    """Compute encoder/decoder lookahead frames from model config.
-
-    Mirrors the DS_DDB padding logic in backbone.py: for each dilated layer,
-    the right (future) padding determines required lookahead frames.
-
-    Args:
-        model_config: OmegaConf model config node
-
-    Returns:
-        (encoder_lookahead, decoder_lookahead) in frames
-    """
-    depth = getattr(model_config, 'dense_depth', 4)
-    enc_ratio = list(getattr(model_config, 'encoder_padding_ratio', [0.5, 0.5]))
-    dec_ratio = list(getattr(model_config, 'decoder_padding_ratio', [0.5, 0.5]))
-
-    def _calc_lookahead(left_ratio: float, depth: int) -> int:
-        lookahead = 0
-        for i in range(depth):
-            dil = 2 ** i
-            # get_padding_2d((3,3), (dil,1)) -> time padding_one_side = dil
-            time_padding_total = dil * 2
-            time_padding_left = round(time_padding_total * left_ratio)
-            time_padding_right = time_padding_total - time_padding_left
-            lookahead += time_padding_right
-        return lookahead
-
-    enc_la = _calc_lookahead(enc_ratio[0], depth)
-    dec_la = _calc_lookahead(dec_ratio[0], depth)
-    return enc_la, dec_la
 
 
 def count_parameters(model: torch.nn.Module) -> int:
@@ -101,6 +69,7 @@ def measure_streaming_rtf(
     audio: torch.Tensor,
     warmup: int,
     repeats: int,
+    sample_rate: int = 16000,
 ) -> Tuple[RTFResult, RTFResult]:
     """Measure RTF in streaming mode.
 
@@ -112,7 +81,7 @@ def measure_streaming_rtf(
         iterations that drain the lookahead buffer.
     """
     osp = streaming_model.output_samples_per_chunk
-    total_audio_sec = len(audio) / 16000.0
+    total_audio_sec = len(audio) / sample_rate
     audio_iters = math.ceil(len(audio) / osp)
 
     flush = streaming_model.samples_per_chunk * (streaming_model.total_lookahead + 2)
@@ -186,10 +155,11 @@ def main():
 
     # Compute lookahead from config
     enc_la, dec_la = compute_lookahead_from_config(conf.model)
+    sample_rate = conf.get("sampling_rate", 16000)
 
     # Generate dummy audio
-    test_audio = generate_dummy_audio(args.duration)
-    total_audio_sec = len(test_audio) / 16000.0
+    test_audio = generate_dummy_audio(args.duration, sample_rate=sample_rate)
+    total_audio_sec = len(test_audio) / sample_rate
 
     # Load model for param count
     device = "cpu"
@@ -203,7 +173,7 @@ def main():
     stft_center = conf.model.get("stft_center", True)
     stft_delay = win_size // 2 if stft_center else 0
     latency_samples = (enc_la + dec_la) * hop_size + stft_delay
-    latency_ms = latency_samples / 16000.0 * 1000
+    latency_ms = latency_samples / sample_rate * 1000
 
     hardware = get_hardware_info()
 
@@ -255,8 +225,9 @@ def main():
         audio=test_audio,
         warmup=args.warmup,
         repeats=args.repeats,
+        sample_rate=sample_rate,
     )
-    chunk_audio_sec = args.chunk_size * hop_size / 16000.0
+    chunk_audio_sec = args.chunk_size * hop_size / sample_rate
     ss_per_chunk_ms = ss_result.mean * chunk_audio_sec * 1000
     print(f"Streaming RTF:  {ss_result.mean:.4f} ± {ss_result.std:.4f}  ({ss_per_chunk_ms:.3f}ms per chunk)  [steady-state]")
     if abs(total_result.mean - ss_result.mean) > 0.01:

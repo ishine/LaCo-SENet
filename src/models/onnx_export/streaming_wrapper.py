@@ -210,6 +210,7 @@ class STFTConfig:
     win_size: int = 400
     compress_factor: float = 0.3
     sample_rate: int = 16000
+    stft_center: bool = True
 
     @property
     def freq_size(self) -> int:
@@ -301,8 +302,10 @@ class ONNXDuBLoNet:
         self.output_frames_per_chunk = chunk_size
         self.output_samples_per_chunk = self.output_frames_per_chunk * self.hop_size
 
-        # Latency calculation
-        self.latency_samples = self.total_lookahead * self.hop_size
+        # Latency calculation (matches DuBLoNet)
+        self.stft_center = stft_config.stft_center
+        self.stft_center_delay_samples = self.win_size // 2 if self.stft_center else 0
+        self.latency_samples = self.total_lookahead * self.hop_size + self.stft_center_delay_samples
         self.latency_ms = self.latency_samples / self.sample_rate * 1000
 
         # ONNX state management
@@ -489,6 +492,7 @@ class ONNXDuBLoNet:
             win_size=pytorch_streaming.win_size,
             compress_factor=pytorch_streaming.compress_factor,
             sample_rate=pytorch_streaming.sample_rate,
+            stft_center=pytorch_streaming.stft_center,
         )
 
         # Step 2: Convert to exportable core
@@ -522,10 +526,11 @@ class ONNXDuBLoNet:
         export_time_frames = chunk_size + input_lookahead_frames + decoder_lookahead
 
         if onnx_path is None:
-            # Use temp file
+            # Use temp file — must force export since the file is created empty
             temp_file = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
             onnx_path = temp_file.name
             temp_file.close()
+            force_export = True
 
         if verbose:
             print(f"  Exporting to ONNX: {onnx_path}")

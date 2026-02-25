@@ -1,5 +1,10 @@
 import torch
 
+# Naming convention: `com` = compressed complex spectrogram (mag·cos, mag·sin)
+# stacked along stack_dim.  Used throughout the codebase as the primary
+# representation passed into / returned from the Backbone model.
+
+
 def mag_pha_stft(y, n_fft, hop_size, win_size, compress_factor=1.0, center=True, stack_dim=-1):
 
     hann_window = torch.hann_window(win_size).to(y.device)

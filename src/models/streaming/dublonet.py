@@ -141,6 +141,7 @@ class DuBLoNet(nn.Module):
         rf_sequence_block: Optional[nn.ModuleList] = None,
         freq_size: int = 100,
         stft_center: bool = True,
+        disable_state_guard: bool = False,
     ):
         """
         Initialize DuBLoNet.
@@ -159,8 +160,14 @@ class DuBLoNet(nn.Module):
             sample_rate: Audio sample rate in Hz
             rf_sequence_block: Reshape-free TS_BLOCK ModuleList (if enabled)
             freq_size: Frequency bins (for state initialization)
+            disable_state_guard: If True, disable StateFramesContext so all
+                frames (including lookahead) update streaming state buffers.
+                Used for ablation study of selective state update (C3).
         """
         super().__init__()
+
+        # Ablation: disable selective state update
+        self.disable_state_guard = disable_state_guard
 
         # Store model reference
         self.model = model
@@ -340,6 +347,7 @@ class DuBLoNet(nn.Module):
         fold_bn: bool = False,
         device: Optional[str] = None,
         verbose: bool = True,
+        disable_state_guard: bool = False,
     ) -> "DuBLoNet":
         """
         Create DuBLoNet from a checkpoint directory.
@@ -369,6 +377,7 @@ class DuBLoNet(nn.Module):
             fold_bn: Apply BN folding for CPU inference.
             device: Device to load model on
             verbose: Print loading information
+            disable_state_guard: Disable selective state update (ablation).
 
         Returns:
             DuBLoNet instance
@@ -436,6 +445,7 @@ class DuBLoNet(nn.Module):
             rf_sequence_block=rf_sequence_block,
             freq_size=freq_size,
             stft_center=stft_center,
+            disable_state_guard=disable_state_guard,
         )
 
         # Store config
@@ -512,7 +522,7 @@ class DuBLoNet(nn.Module):
         # the remaining input_lookahead frames provide future context only.
         valid_frames = min(T, self.chunk_size)
 
-        with StateFramesContext(valid_frames):
+        with StateFramesContext(None if self.disable_state_guard else valid_frames):
             # Encoder (always use original model's encoder)
             encoded = self.model.dense_encoder(x)
 
@@ -591,7 +601,7 @@ class DuBLoNet(nn.Module):
         features = ts_out[:, :, :self.chunk_size, :]
         chunk_mag = mag[:, :, :self.chunk_size]
 
-        with StateFramesContext(self.chunk_size):
+        with StateFramesContext(None if self.disable_state_guard else self.chunk_size):
             mask = self.model.mask_decoder(features).squeeze(1).transpose(1, 2)
             est_pha = self.model.phase_decoder(features).squeeze(1).transpose(1, 2)
 
@@ -648,7 +658,7 @@ class DuBLoNet(nn.Module):
         extended_mag = all_mag[:, :, :total_needed]
 
         # Step 4: Process decoder with extended input
-        with StateFramesContext(self.chunk_size):
+        with StateFramesContext(None if self.disable_state_guard else self.chunk_size):
             mask = self.model.mask_decoder(extended_features).squeeze(1).transpose(1, 2)
             est_pha = self.model.phase_decoder(extended_features).squeeze(1).transpose(1, 2)
 

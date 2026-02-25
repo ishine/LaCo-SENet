@@ -12,6 +12,13 @@ def get_padding(kernel_size, dilation=1):
 def get_padding_2d(kernel_size, dilation=(1, 1)):
     return (int((kernel_size[0]*dilation[0] - dilation[0])/2), int((kernel_size[1]*dilation[1] - dilation[1])/2))
 
+def _validate_padding_ratio(padding_ratio, name="padding_ratio"):
+    left, right = padding_ratio
+    assert abs(left + right - 1.0) < 1e-6, \
+        f"{name} must sum to 1.0, got {left + right}"
+    assert 0.0 <= left <= 1.0 and 0.0 <= right <= 1.0, \
+        f"{name} values must be in [0, 1], got ({left}, {right})"
+
 class CausalConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, padding, stride=1, dilation=1, groups=1, bias=True):
         super(CausalConv1d, self).__init__()
@@ -87,12 +94,7 @@ class AsymmetricConv2d(nn.Module):
         time_padding_total = padding[0] * 2
         freq_padding = padding[1]
         left_ratio, right_ratio = padding_ratio
-
-        # Validate padding ratio
-        assert abs(left_ratio + right_ratio - 1.0) < 1e-6, \
-            f"padding_ratio must sum to 1.0, got {left_ratio + right_ratio}"
-        assert 0.0 <= left_ratio <= 1.0 and 0.0 <= right_ratio <= 1.0, \
-            f"padding_ratio values must be in [0, 1], got ({left_ratio}, {right_ratio})"
+        _validate_padding_ratio(padding_ratio)
 
         # Distribute time padding according to ratio
         time_padding_left = round(time_padding_total * left_ratio)
@@ -234,7 +236,8 @@ class Channel_Attention_Block(nn.Module):
                               padding=get_padding(dw_kernel_size), stride=1, groups=dw_channel, bias=True)
         self.sg = SimpleGate()
         if causal:
-            # Causal Depthwise Conv1d: streaming-friendly local pooling
+            # SCA (Simplified Channel Attention): causal depthwise conv for
+            # streaming-friendly local pooling (replaces global average pooling)
             self.sca = nn.Sequential(
                 CausalConv1d(
                     in_channels=dw_channel // 2,
@@ -362,13 +365,7 @@ class DS_DDB(nn.Module):
         self.depth = depth
         self.dense_block = nn.ModuleList([])
 
-        # Validate padding_ratio
-        left_ratio, right_ratio = padding_ratio
-        assert abs(left_ratio + right_ratio - 1.0) < 1e-6, \
-            f"padding_ratio must sum to 1.0, got {left_ratio + right_ratio}"
-        assert 0.0 <= left_ratio <= 1.0 and 0.0 <= right_ratio <= 1.0, \
-            f"padding_ratio values must be in [0, 1], got ({left_ratio}, {right_ratio})"
-
+        _validate_padding_ratio(padding_ratio)
         self.padding_ratio = padding_ratio
 
         # Always use AsymmetricConv2d with specified padding_ratio
@@ -512,9 +509,9 @@ class Backbone(nn.Module):
 
     Args:
         encoder_padding_ratio: (left_ratio, right_ratio) for encoder asymmetric padding (required)
-            - (1.0, 0.0): Fully causal (6.25ms latency)
-            - (0.8333, 0.1667): R=5, 37.5ms latency
-            - (0.5, 0.5): Symmetric (100ms latency)
+            - (1.0, 0.0): Fully causal (12.5ms latency, center=True)
+            - (0.8333, 0.1667): R=5, 75.0ms latency
+            - (0.5, 0.5): Symmetric (200.0ms latency)
             - Must sum to 1.0
         decoder_padding_ratio: (left_ratio, right_ratio) for decoder asymmetric padding (required)
             - Recommended: (1.0, 0.0) for Option B (decoder causal)
@@ -524,7 +521,7 @@ class Backbone(nn.Module):
     Example (Option B configuration):
         model = Backbone(
             ...,
-            encoder_padding_ratio=(0.8333, 0.1667),  # R=5, 37.5ms latency
+            encoder_padding_ratio=(0.8333, 0.1667),  # R=5, 75.0ms latency
             decoder_padding_ratio=(1.0, 0.0),         # Decoder causal
             causal_ts_block=True,                     # TS_BLOCK causal
         )
@@ -559,19 +556,8 @@ class Backbone(nn.Module):
         self.num_tsblock = num_tsblock
         self.causal_ts_block = causal_ts_block
 
-        # Validate encoder_padding_ratio
-        enc_left, enc_right = encoder_padding_ratio
-        assert abs(enc_left + enc_right - 1.0) < 1e-6, \
-            f"encoder_padding_ratio must sum to 1.0, got {enc_left + enc_right}"
-        assert 0.0 <= enc_left <= 1.0 and 0.0 <= enc_right <= 1.0, \
-            f"encoder_padding_ratio values must be in [0, 1], got ({enc_left}, {enc_right})"
-
-        # Validate decoder_padding_ratio
-        dec_left, dec_right = decoder_padding_ratio
-        assert abs(dec_left + dec_right - 1.0) < 1e-6, \
-            f"decoder_padding_ratio must sum to 1.0, got {dec_left + dec_right}"
-        assert 0.0 <= dec_left <= 1.0 and 0.0 <= dec_right <= 1.0, \
-            f"decoder_padding_ratio values must be in [0, 1], got ({dec_left}, {dec_right})"
+        _validate_padding_ratio(encoder_padding_ratio, "encoder_padding_ratio")
+        _validate_padding_ratio(decoder_padding_ratio, "decoder_padding_ratio")
 
         self.encoder_padding_ratio = encoder_padding_ratio
         self.decoder_padding_ratio = decoder_padding_ratio
