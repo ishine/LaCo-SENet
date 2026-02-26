@@ -1,5 +1,5 @@
 """
-DuBLoNet with Lookahead Buffering.
+LaCoSENet with Lookahead Buffering.
 
 This module provides a streaming wrapper that addresses the asymmetric
 convolution problem by buffering features and providing real lookahead context.
@@ -31,7 +31,7 @@ This approach provides:
 - Minimal additional latency beyond the required lookahead frames
 
 Example (decoder-only asymmetric):
-    >>> streaming = DuBLoNet.from_checkpoint(
+    >>> streaming = LaCoSENet.from_checkpoint(
     ...     chkpt_dir="results/experiments/prk_1117_1",
     ...     chunk_size=64,
     ...     encoder_lookahead=0,   # Encoder is causal
@@ -39,7 +39,7 @@ Example (decoder-only asymmetric):
     ... )
 
 Example (both encoder and decoder asymmetric):
-    >>> streaming = DuBLoNet.from_checkpoint(
+    >>> streaming = LaCoSENet.from_checkpoint(
     ...     chkpt_dir="results/experiments/prk_1114_2",
     ...     chunk_size=64,
     ...     encoder_lookahead=7,   # Encoder needs 7 frame lookahead
@@ -71,7 +71,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class DuBLoNet(nn.Module):
+class LaCoSENet(nn.Module):
     """
     Streaming wrapper for Backbone with lookahead buffering.
 
@@ -144,7 +144,7 @@ class DuBLoNet(nn.Module):
         disable_state_guard: bool = False,
     ):
         """
-        Initialize DuBLoNet.
+        Initialize LaCoSENet.
 
         Note: Use `from_checkpoint()` for easier initialization.
 
@@ -348,9 +348,9 @@ class DuBLoNet(nn.Module):
         device: Optional[str] = None,
         verbose: bool = True,
         disable_state_guard: bool = False,
-    ) -> "DuBLoNet":
+    ) -> "LaCoSENet":
         """
-        Create DuBLoNet from a checkpoint directory.
+        Create LaCoSENet from a checkpoint directory.
 
         This automatically:
         1. Loads the model configuration and weights
@@ -380,7 +380,7 @@ class DuBLoNet(nn.Module):
             disable_state_guard: Disable selective state update (ablation).
 
         Returns:
-            DuBLoNet instance
+            LaCoSENet instance
 
         Example configurations:
             - Decoder-only asymmetric: encoder_lookahead=0, decoder_lookahead=7
@@ -390,7 +390,7 @@ class DuBLoNet(nn.Module):
         from src.models.streaming.utils import prepare_streaming_model
 
         if verbose:
-            print(f"Loading DuBLoNet from: {chkpt_dir}")
+            print(f"Loading LaCoSENet from: {chkpt_dir}")
 
         # Use unified model preparation pipeline
         model, metadata = prepare_streaming_model(

@@ -3,7 +3,7 @@ Verify training-inference equivalence: full-sequence vs chunk-wise streaming.
 
 Compares model output spectrograms (est_mag, est_pha) between:
   1. Full-sequence forward pass (Backbone.forward on entire spectrogram)
-  2. Chunk-by-chunk streaming (DuBLoNet.process_spectrogram_buffered)
+  2. Chunk-by-chunk streaming (LaCoSENet.process_spectrogram_buffered)
 
 Both paths receive the SAME input spectrogram (training STFT), isolating
 model-level equivalence from STFT frontend differences.
@@ -28,7 +28,7 @@ from datasets import load_dataset
 from src.data import VoiceBankDataset
 from src.stft import mag_pha_stft
 from src.utils import load_model, load_checkpoint, get_stft_args_from_config
-from src.models.streaming.dublonet import DuBLoNet
+from src.models.streaming.lacosenet import LaCoSENet
 from src.batch_evaluate import compute_streaming_lookahead
 
 # ── Experiment registry ──────────────────────────────────────────────────
@@ -70,7 +70,7 @@ def streaming_forward(streaming_model, noisy_com, chunk_size, enc_la):
     """Chunk-by-chunk streaming forward → (est_mag, est_pha).
 
     Feeds spectrogram slices through process_spectrogram_buffered,
-    matching the chunking that DuBLoNet performs internally.
+    matching the chunking that LaCoSENet performs internally.
     """
     T_total = noisy_com.shape[2]  # [B, F, T, 2]
     all_mag, all_pha = [], []
@@ -118,7 +118,7 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
     dec_la = la_info["dec_la"]
     total_la = la_info["total_la"]
 
-    streaming = DuBLoNet.from_checkpoint(
+    streaming = LaCoSENet.from_checkpoint(
         chkpt_dir=str(exp_seed_dir),
         chkpt_file=chkpt_file,
         chunk_size=chunk_size,

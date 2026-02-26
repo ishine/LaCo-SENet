@@ -1,7 +1,7 @@
 """
 Exportable Neural Network Core for ONNX.
 
-This module provides an ONNX-exportable wrapper for the DuBLoNet
+This module provides an ONNX-exportable wrapper for the LaCoSENet
 neural network core (DenseEncoder + TS_BLOCK + Decoders).
 
 The wrapper:
@@ -50,7 +50,7 @@ class ExportableNNCore(nn.Module):
 
     Example:
         >>> from src.models.onnx_export import ExportableNNCore
-        >>> core = ExportableNNCore.from_dublonet(streaming_model)
+        >>> core = ExportableNNCore.from_lacosenet(streaming_model)
         >>> states = core.init_states(batch_size=1)
         >>> est_mask, est_pha, *next_states = core(mag, pha, *states)
     """
@@ -66,7 +66,7 @@ class ExportableNNCore(nn.Module):
         """
         Initialize ExportableNNCore.
 
-        Note: Use from_dublonet() or from_checkpoint() for easier creation.
+        Note: Use from_lacosenet() or from_checkpoint() for easier creation.
 
         Args:
             dense_encoder: DenseEncoder with functional stateful convs

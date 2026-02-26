@@ -1,8 +1,8 @@
-# DuBLoNet
+# LaCoSENet
 
 ## 프로젝트 목적
 
-DuBLoNet 음성 향상(speech enhancement) 모델에 대한 학회 논문 작성을 위한 학습 및 실험 프로젝트.
+LaCoSENet 음성 향상(speech enhancement) 모델에 대한 학회 논문 작성을 위한 학습 및 실험 프로젝트.
 - **모델**: Backbone — 주파수 도메인 기반 causal speech enhancement 모델
 - **핵심 연구**: 비대칭 convolution의 padding ratio를 조절하여 algorithmic latency를 제어하고, state buffer + lookahead buffer 기반 streaming 추론 구현
 - **데이터셋**: VoiceBank-DEMAND 16kHz (HuggingFace: `JacobLinCool/VoiceBank-DEMAND-16k`)
@@ -11,7 +11,7 @@ DuBLoNet 음성 향상(speech enhancement) 모델에 대한 학회 논문 작성
 ## 코드베이스 구성
 
 ```
-DuBLoNet/
+LaCoSENet/
 ├── conf/
 │   └── config.yaml              # Hydra 학습 설정 (모델, 데이터셋, 손실함수, 최적화)
 ├── src/
@@ -33,7 +33,7 @@ DuBLoNet/
 │   │   ├── streaming/           # 스트리밍 추론 관련 모듈
 │   │   │   ├── layers/          # StatefulConv, ReshapeFree 등 스트리밍 레이어
 │   │   │   ├── converters/      # 일반 모델 → 스트리밍 모델 변환기 (conv, reshape_free)
-│   │   │   ├── dublonet.py      # DuBLoNet wrapper (STFT overlap-add + lookahead buffering)
+│   │   │   ├── lacosenet.py      # LaCoSENet wrapper (STFT overlap-add + lookahead buffering)
 │   │   │   ├── utils.py         # 스트리밍 유틸리티 (manual iSTFT, latency 계산 등)
 │   │   │   └── cpu_optimizations.py  # CPU 추론 최적화
 │   │   └── onnx_export/         # ONNX 내보내기용 모듈
@@ -98,8 +98,8 @@ python -m src.enhance --chkpt_dir <exp_dir> --use_stateful_conv
 |------|------|
 | `benchmark_comparison.md` | 벤치마크 모델(RNNoise, GaGNet, SEMamba 등) 대비 latency/성능 비교표 |
 | `benchmark_latency_analysis.md` | 벤치마크 모델 latency 분석 |
-| `dublonet_architecture.md` | DuBLoNet 아키텍처 상세 기술 문서 (코드 기반 분석) |
-| `dublonet_streaming_context.md` | DuBLoNet 스트리밍 컨텍스트 분석 |
+| `lacosenet_architecture.md` | LaCoSENet 아키텍처 상세 기술 문서 (코드 기반 분석) |
+| `lacosenet_streaming_context.md` | LaCoSENet 스트리밍 컨텍스트 분석 |
 | `algorithmic_latency_definition.md` | Algorithmic latency 정의 및 분석 |
 | `rtf_experiment_design.md` | RTF 실험 설계서 |
 | `results.md` | 학습 실험 결과 기록 |

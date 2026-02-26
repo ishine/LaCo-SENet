@@ -1,5 +1,5 @@
 """
-Unified batch evaluation script for DuBLoNet experiments.
+Unified batch evaluation script for LaCoSENet experiments.
 
 Three subcommands cover all evaluation modes:
 
@@ -140,7 +140,7 @@ def compute_streaming_lookahead(conf, chunk_size: int):
     enc_la = compute_lookahead_frames(enc_ratio)
     dec_la = compute_lookahead_frames(dec_ratio)
 
-    # Match DuBLoNet streaming wrapper behavior:
+    # Match LaCoSENet streaming wrapper behavior:
     # - input_lookahead_frames = encoder lookahead (no min-2-frame hack needed)
     # - STFT future buffering (center=False) eliminates reflect padding requirement
     input_la = int(enc_la)
@@ -458,7 +458,7 @@ def run_fullseq(args):
 
 def run_streaming(args):
     """Handler for 'streaming' subcommand."""
-    from src.models.streaming.dublonet import DuBLoNet
+    from src.models.streaming.lacosenet import LaCoSENet
 
     output_dir = Path(args.output_dir)
     seed_tag = args.exp_pattern.replace("*", "").strip("_")
@@ -522,7 +522,7 @@ def run_streaming(args):
 
             ev_loader = create_data_loader(hf_dataset, conf, args.num_workers)
 
-            streaming = DuBLoNet.from_checkpoint(
+            streaming = LaCoSENet.from_checkpoint(
                 chkpt_dir=str(exp_dir),
                 chkpt_file=chkpt_file,
                 chunk_size=args.chunk_size,
@@ -599,7 +599,7 @@ def run_streaming(args):
 
 def run_chunksweep(args):
     """Handler for 'chunksweep' subcommand."""
-    from src.models.streaming.dublonet import DuBLoNet
+    from src.models.streaming.lacosenet import LaCoSENet
     from src.models.streaming.utils import prepare_streaming_model
 
     output_dir = Path(args.output_dir)
@@ -674,7 +674,7 @@ def run_chunksweep(args):
                 logger.info(f"  [cs={cs}] Lookahead: enc={la['encoder_lookahead']}, dec={la['decoder_lookahead']}, "
                             f"total={la['total_lookahead']}, latency={la['latency_ms']:.2f}ms")
 
-                dublonet = DuBLoNet(
+                lacosenet = LaCoSENet(
                     model=model,
                     chunk_size=cs,
                     encoder_lookahead=la["encoder_lookahead"],
@@ -690,7 +690,7 @@ def run_chunksweep(args):
 
                 shift_samples = la["stft_center_delay_samples"] if getattr(args, "align_ola", False) else 0
                 metrics = evaluate_streaming_single(
-                    dublonet, ev_loader, args.device, logger,
+                    lacosenet, ev_loader, args.device, logger,
                     shift_samples=shift_samples,
                 )
 
@@ -702,7 +702,7 @@ def run_chunksweep(args):
                 )
 
                 chunk_results[str(cs)] = metrics
-                del dublonet
+                del lacosenet
 
             all_results[exp_name] = {
                 "best_step": best_step,
@@ -796,7 +796,7 @@ def run_chunksweep(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Unified batch evaluation for DuBLoNet experiments",
+        description="Unified batch evaluation for LaCoSENet experiments",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
@@ -837,7 +837,7 @@ examples:
     p_stream.add_argument("--exp_pattern", type=str, default="*s2039",
                           help="Glob pattern to match experiment directories.")
     p_stream.add_argument("--chunk_size", type=int, default=1,
-                          help="DuBLoNet chunk size in STFT frames.")
+                          help="LaCoSENet chunk size in STFT frames.")
     p_stream.add_argument("--align_ola", action="store_true",
                           help="Compensate OLA center shift (win_size//2 samples)")
     p_stream.add_argument("--split", type=str, default=None,

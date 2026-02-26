@@ -274,7 +274,7 @@ class StatefulAsymmetricConv2d(StatefulLayerMixin, nn.Module):
 
     State is maintained only for the left (past) time padding.
     Right (future) time padding is zero-padded by default. For models with
-    asymmetric padding that require future context, use DuBLoNet
+    asymmetric padding that require future context, use LaCoSENet
     which provides real lookahead frames through input buffering.
 
     Attributes:
@@ -288,7 +288,7 @@ class StatefulAsymmetricConv2d(StatefulLayerMixin, nn.Module):
     Note:
         - For fully causal models (padding_ratio=(1.0, 0.0)): streaming output
           matches full-sequence output exactly.
-        - For asymmetric models (right_ratio > 0): use with BufferedDuBLoNet
+        - For asymmetric models (right_ratio > 0): use with BufferedLaCoSENet
           to provide real future context. The wrapper provides extended input that
           includes lookahead frames, so right padding effectively has real data.
     """

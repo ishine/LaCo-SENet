@@ -6,7 +6,7 @@
 # author: yunsik kim
 """Measure Real-Time Factor (RTF) for streaming Backbone models.
 
-Feeds dummy audio through the DuBLoNet streaming pipeline chunk by chunk
+Feeds dummy audio through the LaCoSENet streaming pipeline chunk by chunk
 and reports RTF (wall-clock / audio duration).
 
 Default arguments are tuned for single-thread CPU RTF measurement:
@@ -193,9 +193,9 @@ def main():
     # Streaming RTF
     print("Creating streaming model...")
     if args.use_onnx:
-        from src.models.onnx_export import ONNXDuBLoNet
+        from src.models.onnx_export import ONNXLaCoSENet
 
-        streaming_model = ONNXDuBLoNet.from_checkpoint(
+        streaming_model = ONNXLaCoSENet.from_checkpoint(
             chkpt_dir=args.chkpt_dir,
             chkpt_file=args.chkpt_file,
             chunk_size=args.chunk_size,
@@ -205,9 +205,9 @@ def main():
             verbose=True,
         )
     else:
-        from src.models.streaming.dublonet import DuBLoNet
+        from src.models.streaming.lacosenet import LaCoSENet
 
-        streaming_model = DuBLoNet.from_checkpoint(
+        streaming_model = LaCoSENet.from_checkpoint(
             chkpt_dir=args.chkpt_dir,
             chkpt_file=args.chkpt_file,
             chunk_size=args.chunk_size,

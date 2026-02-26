@@ -14,7 +14,7 @@ Zero-insertion upsampling is implemented using DepthToSpace (PixelShuffle),
 which has broad runtime support including NNAPI.
 
 Reference:
-    See docs/dublonet_onnx_int8_export_plan.md section 5.5
+    See docs/lacosenet_onnx_int8_export_plan.md section 5.5
 """
 
 from __future__ import annotations

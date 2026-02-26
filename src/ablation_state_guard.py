@@ -33,7 +33,7 @@ from src.batch_evaluate import (
     create_data_loader,
     evaluate_streaming_single,
 )
-from src.models.streaming.dublonet import DuBLoNet
+from src.models.streaming.lacosenet import LaCoSENet
 from src.utils import bold
 
 EXPERIMENT_MATRIX = {
@@ -61,7 +61,7 @@ def run_single_evaluation(exp_dir, chkpt_file, conf, chunk_size,
     """Evaluate a single (model, chunk_size, guard) condition."""
     la = compute_streaming_lookahead(conf, chunk_size=chunk_size)
 
-    streaming = DuBLoNet.from_checkpoint(
+    streaming = LaCoSENet.from_checkpoint(
         chkpt_dir=str(exp_dir),
         chkpt_file=chkpt_file,
         chunk_size=chunk_size,

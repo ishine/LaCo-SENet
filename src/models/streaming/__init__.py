@@ -9,17 +9,17 @@ Package Structure:
         - StatefulConv*
     - converters/: Model transformation utilities
         - convert_to_stateful
-    - dublonet.py: DuBLoNet streaming wrapper
+    - lacosenet.py: LaCoSENet streaming wrapper
     - utils.py: Core utilities (StateFramesContext, prepare_streaming_model)
 
-DuBLoNet Configuration:
+LaCoSENet Configuration:
     - **Fully Causal** (enc/dec lookahead=0): Immediate output, no buffering delay
     - **Asymmetric Decoder** (dec lookahead>0): Buffered processing
     - **Asymmetric Encoder+Decoder** (both>0): Full lookahead buffering
 
 Example (fully causal model - immediate output):
-    >>> from src.models.streaming import DuBLoNet
-    >>> streaming = DuBLoNet.from_checkpoint(
+    >>> from src.models.streaming import LaCoSENet
+    >>> streaming = LaCoSENet.from_checkpoint(
     ...     "path/to/checkpoint",
     ...     encoder_lookahead=0,
     ...     decoder_lookahead=0,  # Immediate mode
@@ -28,8 +28,8 @@ Example (fully causal model - immediate output):
     ...     output = streaming.process_samples(chunk)
 
 Example (asymmetric model with encoder/decoder lookahead):
-    >>> from src.models.streaming import DuBLoNet
-    >>> streaming = DuBLoNet.from_checkpoint(
+    >>> from src.models.streaming import LaCoSENet
+    >>> streaming = LaCoSENet.from_checkpoint(
     ...     "path/to/checkpoint",
     ...     encoder_lookahead=7,   # >0 if encoder has asymmetric padding
     ...     decoder_lookahead=7,   # >0 if decoder has asymmetric padding
@@ -63,7 +63,7 @@ from .converters import (
 # =============================================================================
 # Wrappers
 # =============================================================================
-from .dublonet import DuBLoNet
+from .lacosenet import LaCoSENet
 
 __all__ = [
     # === Layers ===
@@ -76,5 +76,5 @@ __all__ = [
     "reset_streaming_state",
     "get_stateful_layer_count",
     # === Wrappers ===
-    "DuBLoNet",
+    "LaCoSENet",
 ]

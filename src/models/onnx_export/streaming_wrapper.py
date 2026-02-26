@@ -1,18 +1,18 @@
 """
-ONNX DuBLoNet Wrapper.
+ONNX LaCoSENet Wrapper.
 
 This module provides an ONNX Runtime-based streaming wrapper that has the same
-interface as DuBLoNet but uses ONNX for neural network inference.
+interface as LaCoSENet but uses ONNX for neural network inference.
 
 Key features:
-1. Same interface as DuBLoNet (from_checkpoint, process_samples, process_audio)
+1. Same interface as LaCoSENet (from_checkpoint, process_samples, process_audio)
 2. STFT/iSTFT processed on host in FP32
 3. Neural network core runs via ONNX Runtime
 4. Full support for encoder/decoder lookahead buffering
 
 Usage:
     # Create from checkpoint (exports ONNX automatically)
-    streaming = ONNXDuBLoNet.from_checkpoint(
+    streaming = ONNXLaCoSENet.from_checkpoint(
         chkpt_dir="results/experiments/prk_1117_1",
         chunk_size=64,
         encoder_lookahead=0,
@@ -217,11 +217,11 @@ class STFTConfig:
         return self.n_fft // 2 + 1
 
 
-class ONNXDuBLoNet:
+class ONNXLaCoSENet:
     """
     ONNX Runtime-based streaming wrapper for Backbone.
 
-    This class provides the same interface as DuBLoNet but uses
+    This class provides the same interface as LaCoSENet but uses
     ONNX Runtime for neural network inference. The STFT/iSTFT operations
     are performed on the host in FP32.
 
@@ -230,7 +230,7 @@ class ONNXDuBLoNet:
              -> ONNX NN Core (with state I/O)
              -> est_mask/est_pha -> iSTFT (Host) -> output
 
-    Lookahead buffering (encoder/decoder) works exactly as in DuBLoNet:
+    Lookahead buffering (encoder/decoder) works exactly as in LaCoSENet:
     - encoder_lookahead: Delays encoder processing for asymmetric encoder padding
     - decoder_lookahead: Buffers encoder features for asymmetric decoder padding
 
@@ -256,7 +256,7 @@ class ONNXDuBLoNet:
         expected_time_frames: Optional[int] = None,
     ):
         """
-        Initialize ONNXDuBLoNet.
+        Initialize ONNXLaCoSENet.
 
         Note: Use `from_checkpoint()` for easier initialization.
 
@@ -302,7 +302,7 @@ class ONNXDuBLoNet:
         self.output_frames_per_chunk = chunk_size
         self.output_samples_per_chunk = self.output_frames_per_chunk * self.hop_size
 
-        # Latency calculation (matches DuBLoNet)
+        # Latency calculation (matches LaCoSENet)
         self.stft_center = stft_config.stft_center
         self.stft_center_delay_samples = self.win_size // 2 if self.stft_center else 0
         self.latency_samples = self.total_lookahead * self.hop_size + self.stft_center_delay_samples
@@ -405,9 +405,9 @@ class ONNXDuBLoNet:
         force_export: bool = False,
         use_reshape_free: bool = False,
         verbose: bool = True,
-    ) -> "ONNXDuBLoNet":
+    ) -> "ONNXLaCoSENet":
         """
-        Create ONNXDuBLoNet from a checkpoint directory.
+        Create ONNXLaCoSENet from a checkpoint directory.
 
         This automatically:
         1. Loads the PyTorch model
@@ -436,16 +436,16 @@ class ONNXDuBLoNet:
             verbose: Print loading information
 
         Returns:
-            ONNXDuBLoNet instance
+            ONNXLaCoSENet instance
 
         Example:
             # CPU (default)
-            streaming = ONNXDuBLoNet.from_checkpoint(chkpt_dir="...")
+            streaming = ONNXLaCoSENet.from_checkpoint(chkpt_dir="...")
 
             # QNN HTP (Qualcomm NPU)
             from src.models.onnx_export import QNNConfig
             qnn_cfg = QNNConfig(backend_type="htp", soc_model="SM8550")
-            streaming = ONNXDuBLoNet.from_checkpoint(
+            streaming = ONNXLaCoSENet.from_checkpoint(
                 chkpt_dir="...",
                 qnn_config=qnn_cfg,
             )
@@ -455,7 +455,7 @@ class ONNXDuBLoNet:
         except ImportError:
             raise ImportError("onnxruntime is required. Install with: pip install onnxruntime")
 
-        from src.models.streaming import DuBLoNet
+        from src.models.streaming import LaCoSENet
         from src.models.onnx_export import (
             StatefulExportableNNCore,
             export_stateful_nncore_to_onnx,
@@ -472,10 +472,10 @@ class ONNXDuBLoNet:
         chkpt_dir = Path(chkpt_dir)
 
         if verbose:
-            print(f"Loading ONNXDuBLoNet from: {chkpt_dir}")
+            print(f"Loading ONNXLaCoSENet from: {chkpt_dir}")
 
-        # Step 1: Load PyTorch model via DuBLoNet
-        pytorch_streaming = DuBLoNet.from_checkpoint(
+        # Step 1: Load PyTorch model via LaCoSENet
+        pytorch_streaming = LaCoSENet.from_checkpoint(
             chkpt_dir=str(chkpt_dir),
             chkpt_file=chkpt_file,
             chunk_size=chunk_size,
@@ -648,9 +648,9 @@ class ONNXDuBLoNet:
         phase_output_mode: Optional[str] = None,
         infer_type: str = "masking",
         verbose: bool = True,
-    ) -> "ONNXDuBLoNet":
+    ) -> "ONNXLaCoSENet":
         """
-        Create ONNXDuBLoNet from an existing ONNX file.
+        Create ONNXLaCoSENet from an existing ONNX file.
 
         This is the recommended entry point for Android integration where the ONNX
         model is shipped as a fixed artifact (e.g., assets -> app files directory).
@@ -671,7 +671,7 @@ class ONNXDuBLoNet:
 
         Example:
             # CPU (default)
-            streaming = ONNXDuBLoNet.from_onnx_path("model_int8.onnx")
+            streaming = ONNXLaCoSENet.from_onnx_path("model_int8.onnx")
 
             # QNN HTP with context caching
             qnn_cfg = QNNConfig(
@@ -680,7 +680,7 @@ class ONNXDuBLoNet:
                 context_cache_enabled=True,
                 context_cache_path="model_qnn_ctx.onnx",
             )
-            streaming = ONNXDuBLoNet.from_onnx_path(
+            streaming = ONNXLaCoSENet.from_onnx_path(
                 "model_int8.onnx",
                 qnn_config=qnn_cfg,
             )
@@ -698,7 +698,7 @@ class ONNXDuBLoNet:
 
         onnx_path = str(Path(onnx_path))
         if verbose:
-            print(f"Loading ONNXDuBLoNet from ONNX: {onnx_path}")
+            print(f"Loading ONNXLaCoSENet from ONNX: {onnx_path}")
             if qnn_config is not None:
                 print(f"  QNN EP: backend={qnn_config.backend_type}, soc={qnn_config.soc_model}")
             else:
@@ -1122,7 +1122,7 @@ class ONNXDuBLoNet:
 
 
 __all__ = [
-    "ONNXDuBLoNet",
+    "ONNXLaCoSENet",
     "STFTConfig",
     "QNNConfig",
     "create_ort_session",

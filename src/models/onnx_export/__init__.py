@@ -1,8 +1,8 @@
 """
-ONNX Export utilities for DuBLoNet.
+ONNX Export utilities for LaCoSENet.
 
 This package provides tools for exporting the neural network core of
-DuBLoNet to ONNX format.
+LaCoSENet to ONNX format.
 
 Key Components:
     - ExportableNNCore: ONNX-exportable wrapper (stateless version)
@@ -31,7 +31,7 @@ from .stateful_core_rf import (
     verify_stateful_rf_onnx_export,
 )
 from .streaming_wrapper import (
-    ONNXDuBLoNet,
+    ONNXLaCoSENet,
     QNNConfig,
     STFTConfig,
     create_ort_session,
@@ -56,7 +56,7 @@ __all__ = [
     "StateInfo",
     "StateRegistry",
     # Streaming wrapper
-    "ONNXDuBLoNet",
+    "ONNXLaCoSENet",
     "STFTConfig",
     # QNN Execution Provider support
     "QNNConfig",
