@@ -114,9 +114,9 @@ def verify_one(exp_name, exp_dir, noisy, device, chunk_size=1):
 
     # ── Streaming model ──
     la_info = compute_streaming_lookahead(conf, chunk_size)
-    enc_la = la_info["enc_la"]
-    dec_la = la_info["dec_la"]
-    total_la = la_info["total_la"]
+    enc_la = la_info["encoder_lookahead"]
+    dec_la = la_info["decoder_lookahead"]
+    total_la = la_info["total_lookahead"]
 
     streaming = LaCoSENet.from_checkpoint(
         chkpt_dir=str(exp_seed_dir),

@@ -79,10 +79,8 @@ def load_test_dataset():
 
 def create_data_loader(hf_dataset, conf, num_workers):
     """Create a DataLoader for evaluation (batch_size=1)."""
-    use_pcs400 = conf.dset.get("use_pcs400", False)
     ev_dataset = VoiceBankDataset(
         hf_dataset, segment=None, with_id=True, with_text=True,
-        use_pcs400=use_pcs400,
     )
     return DataLoader(
         dataset=ev_dataset,
@@ -149,11 +147,7 @@ def compute_streaming_lookahead(conf, chunk_size: int):
     hop_size = conf.model.get("hop_len", 100)
     sample_rate = conf.get("sampling_rate", 16000)
     win_size = conf.model.get("win_len", 400)
-    stft_center = conf.model.get("stft_center", True)
-    if stft_center:
-        stft_center_delay_samples = win_size // 2  # STFT future buffering delay
-    else:
-        stft_center_delay_samples = 0
+    stft_center_delay_samples = win_size // 2  # STFT future buffering delay
     latency_ms = (total_la * hop_size + stft_center_delay_samples) / sample_rate * 1000
 
     return {
@@ -166,7 +160,6 @@ def compute_streaming_lookahead(conf, chunk_size: int):
         "latency_ms": latency_ms,
         "hop_size": hop_size,
         "win_size": win_size,
-        "stft_center": stft_center,
         "stft_center_delay_samples": stft_center_delay_samples,
         "sample_rate": sample_rate,
     }
@@ -216,13 +209,22 @@ def evaluate_fullseq_single(model, data_loader, stft_args, device, logger):
     }
 
 
-def evaluate_streaming_single(streaming_model, data_loader, device, logger,
-                              shift_samples=0):
+def evaluate_streaming_single(
+    streaming_model,
+    data_loader,
+    device,
+    logger,
+    shift_samples=0,
+    tail_trim_samples=0,
+):
     """Run streaming evaluation, return dict of metrics.
 
     Args:
         shift_samples: Number of leading samples to skip from enhanced signal
             before metric computation (OLA center shift compensation).
+        tail_trim_samples: Number of trailing samples to remove from BOTH clean
+            and enhanced signals before metric computation. Useful to exclude
+            the tail boundary region affected by lookahead flush.
     """
     results = []
 
@@ -242,6 +244,10 @@ def evaluate_streaming_single(streaming_model, data_loader, device, logger,
             length = min(len(clean_np), len(enhanced_np))
             clean_np = clean_np[:length]
             enhanced_np = enhanced_np[:length]
+
+            if tail_trim_samples and tail_trim_samples > 0 and length > tail_trim_samples:
+                clean_np = clean_np[:-tail_trim_samples]
+                enhanced_np = enhanced_np[:-tail_trim_samples]
 
             results.append(compute_metrics(clean_np, enhanced_np))
 
@@ -685,7 +691,6 @@ def run_chunksweep(args):
                     compress_factor=compress_factor,
                     sample_rate=sample_rate,
                     freq_size=freq_size,
-                    stft_center=la["stft_center"],
                 )
 
                 shift_samples = la["stft_center_delay_samples"] if getattr(args, "align_ola", False) else 0

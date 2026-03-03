@@ -134,8 +134,7 @@ if __name__=="__main__":
     hf_dataset_id = conf.dset.get("hf_dataset_id", "JacobLinCool/VoiceBank-DEMAND-16k")
     testset = load_dataset(hf_dataset_id, split="test")
 
-    use_pcs400 = conf.dset.get("use_pcs400", False) if hasattr(conf, "dset") else False
-    ev_dataset = VoiceBankDataset(testset, segment=None, with_id=True, with_text=True, use_pcs400=use_pcs400)
+    ev_dataset = VoiceBankDataset(testset, segment=None, with_id=True, with_text=True)
     ev_loader = DataLoader(
         dataset=ev_dataset,
         batch_size=1,

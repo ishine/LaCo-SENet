@@ -79,10 +79,9 @@ def run(args):
 
     # Determine training segment size
     from src.receptive_field import compute_receptive_field, rf_to_segment
-    stft_center = args.model.get("stft_center", True)
     raw_segment = args.dset.get("segment", 64000)
     if raw_segment == "auto":
-        segment = rf_to_segment(args.model, sampling_rate=args.sampling_rate, center=stft_center)
+        segment = rf_to_segment(args.model, sampling_rate=args.sampling_rate)
         rf = compute_receptive_field(args.model, sampling_rate=args.sampling_rate)
         logger.info(f"Auto segment from RF: {rf.total_rf_frames} frames = "
                     f"{rf.total_rf_samples} samples -> aligned to {segment} samples "
@@ -101,11 +100,7 @@ def run(args):
     trainset = _vb_dataset["train"]
     testset = _vb_dataset["test"]
 
-    use_pcs400 = args.dset.get("use_pcs400", False)
-    if use_pcs400:
-        logger.info("PCS400 enabled: applying perceptual contrast stretching to clean targets")
-
-    tr_dataset = VoiceBankDataset(trainset, segment=segment, use_pcs400=use_pcs400)
+    tr_dataset = VoiceBankDataset(trainset, segment=segment)
     tr_loader = DataLoader(
         dataset=tr_dataset,
         batch_size=args.batch_size,
@@ -114,7 +109,7 @@ def run(args):
         pin_memory=True
     )
 
-    va_dataset = VoiceBankDataset(testset, segment=None, use_pcs400=use_pcs400)
+    va_dataset = VoiceBankDataset(testset, segment=None)
     va_loader = DataLoader(
         dataset=va_dataset,
         batch_size=1,
@@ -123,7 +118,7 @@ def run(args):
         pin_memory=True
     )
 
-    ev_dataset = VoiceBankDataset(testset, segment=None, with_id=True, with_text=True, use_pcs400=use_pcs400)
+    ev_dataset = VoiceBankDataset(testset, segment=None, with_id=True, with_text=True)
     ev_loader = DataLoader(
         dataset=ev_dataset,
         batch_size=1,

@@ -209,10 +209,10 @@ def load_model(model_params: Dict[str, Any], device: str = 'cuda'):
         >>> model = load_model(params, "cuda")
     """
     from src.models.backbone import Backbone
-    # Filter out pipeline-level keys that are not Backbone constructor params
-    _non_backbone_keys = {"stft_center"}
-    backbone_params = {k: v for k, v in model_params.items() if k not in _non_backbone_keys}
-    model = Backbone(**backbone_params)
+    import inspect
+    valid_keys = inspect.signature(Backbone.__init__).parameters
+    filtered = {k: v for k, v in model_params.items() if k in valid_keys}
+    model = Backbone(**filtered)
     return model.to(device)
 
 
@@ -341,7 +341,6 @@ def get_stft_args_from_config(model_args) -> Dict[str, Any]:
         "hop_size": model_args.get("hop_len", fft_len // 4),
         "win_size": model_args.get("win_len", fft_len),
         "compress_factor": model_args.get("compress_factor", 1.0),
-        "center": model_args.get("stft_center", True),
     }
 
 

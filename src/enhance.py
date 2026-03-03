@@ -163,7 +163,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--chkpt_dir", type=str, default='.', help="Path to the checkpoint directory.")
-    parser.add_argument("--chkpt_file", type=str, default="best.th", help="Checkpoint file name.")
+    parser.add_argument("--chkpt_file", type=str, default=".", help="Checkpoint file name.")
     parser.add_argument("--output_dir", type=str, default="samples", help="Output directory for enhanced samples.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device (cuda or cpu).")
 
@@ -221,8 +221,7 @@ if __name__ == "__main__":
     hf_dataset_id = conf.dset.get("hf_dataset_id", "JacobLinCool/VoiceBank-DEMAND-16k")
     testset = load_dataset(hf_dataset_id, split="test")
 
-    use_pcs400 = conf.dset.get("use_pcs400", False) if hasattr(conf, "dset") else False
-    tt_dataset = VoiceBankDataset(testset, segment=None, with_id=True, with_text=True, use_pcs400=use_pcs400)
+    tt_dataset = VoiceBankDataset(testset, segment=None, with_id=True, with_text=True)
 
     tt_loader = DataLoader(
         dataset=tt_dataset,

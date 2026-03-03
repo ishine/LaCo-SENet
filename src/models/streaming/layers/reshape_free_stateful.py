@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.models.streaming.layers.reshape_free import (
-    AxisLayerNorm,
     ChannelLayerNorm2d,
     SimpleGate2d,
 )

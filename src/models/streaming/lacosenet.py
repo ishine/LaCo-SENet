@@ -61,7 +61,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.stft import mag_pha_stft, manual_istft_ola
+from src.stft import manual_istft_ola
 
 if TYPE_CHECKING:
     from src.models.streaming.layers.reshape_free_stateful import (
@@ -140,7 +140,6 @@ class LaCoSENet(nn.Module):
         sample_rate: int = 16000,
         rf_sequence_block: Optional[nn.ModuleList] = None,
         freq_size: int = 100,
-        stft_center: bool = True,
         disable_state_guard: bool = False,
     ):
         """
@@ -179,19 +178,10 @@ class LaCoSENet(nn.Module):
         self.win_size = win_size
         self.compress_factor = compress_factor
         self.sample_rate = sample_rate
-        # Training STFT center mode:
-        # stft_center=True: model trained with center=True STFT.
-        #   Streaming emulates via center=False + manual context buffers
-        #   (win_size/2 past + win_size/2 future), adding stft_center_delay.
-        # stft_center=False: model trained with center=False STFT.
-        #   Streaming uses center=False directly, no context buffers needed.
-        self.stft_center = stft_center
-        if stft_center:
-            self.stft_future_samples = self.win_size // 2
-            self.stft_center_delay_samples = self.stft_future_samples
-        else:
-            self.stft_future_samples = 0
-            self.stft_center_delay_samples = 0
+        # Streaming emulates center=True via center=False + manual context buffers
+        # (win_size/2 past + win_size/2 future), adding stft_center_delay.
+        self.stft_future_samples = self.win_size // 2
+        self.stft_center_delay_samples = self.stft_future_samples
 
         # Streaming parameters
         self.chunk_size = chunk_size
@@ -201,14 +191,9 @@ class LaCoSENet(nn.Module):
         self.total_lookahead = self.input_lookahead_frames + decoder_lookahead
 
         self.total_frames_needed = chunk_size + self.input_lookahead_frames
-        if stft_center:
-            # center=True: chunk includes stft_future_samples (W/2) for STFT right context.
-            # Full STFT input = [past_context(W/2) | chunk_samples(N + W/2)]
-            self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + self.stft_future_samples
-        else:
-            # center=False: STFT(center=False) needs (T-1)*hop + n_fft samples for T frames.
-            # No context prepending needed.
-            self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + n_fft
+        # chunk includes stft_future_samples (W/2) for STFT right context.
+        # Full STFT input = [past_context(W/2) | chunk_samples(N + W/2)]
+        self.samples_per_chunk = (self.total_frames_needed - 1) * hop_size + self.stft_future_samples
 
         # Output step is ALWAYS chunk_size frames (i.e., chunk_size * hop_size samples).
         # This must match how we slide the input buffer; otherwise, time alignment drifts.
@@ -239,12 +224,8 @@ class LaCoSENet(nn.Module):
         self.input_buffer = torch.tensor([], dtype=torch.float32)
         self.feature_buffer: List[Dict[str, Any]] = []  # Encoded features for decoder lookahead
         self._buffered_frames = 0
-        if self.stft_center:
-            # center=True: STFT past context buffer for center emulation
-            self._stft_context = torch.zeros(self.win_size // 2, dtype=torch.float32)
-        else:
-            # center=False: no context buffer needed
-            self._stft_context = None
+        # STFT past context buffer for center emulation
+        self._stft_context = torch.zeros(self.win_size // 2, dtype=torch.float32)
 
         # OLA buffer for cross-chunk overlap-add
         self._ola_buffer = torch.zeros(self.ola_tail_size, dtype=torch.float32)
@@ -322,7 +303,6 @@ class LaCoSENet(nn.Module):
             "decoder_lookahead": self.decoder_lookahead,
             "input_lookahead_frames": self.input_lookahead_frames,
             "total_lookahead": self.total_lookahead,
-            "stft_center": self.stft_center,
             "stft_center_delay_samples": self.stft_center_delay_samples,
             "output_frames_per_chunk": self.output_frames_per_chunk,
             "samples_per_chunk": self.samples_per_chunk,
@@ -423,7 +403,6 @@ class LaCoSENet(nn.Module):
         n_fft = getattr(model_params, 'n_fft', 400)
         win_size = getattr(model_params, 'win_size', 400)
         compress_factor = getattr(model_params, 'compress_factor', 0.3)
-        stft_center = getattr(model_params, 'stft_center', True)
 
         # Calculate freq_size from actual encoder output (not STFT bins)
         # DenseEncoder's dense_conv_2 has stride=(1,2), halving freq dimension
@@ -444,7 +423,6 @@ class LaCoSENet(nn.Module):
             compress_factor=compress_factor,
             rf_sequence_block=rf_sequence_block,
             freq_size=freq_size,
-            stft_center=stft_center,
             disable_state_guard=disable_state_guard,
         )
 
@@ -470,22 +448,26 @@ class LaCoSENet(nn.Module):
         return instance
 
     def _stft(self, audio: Tensor) -> Tensor:
-        """Compute STFT and return complex spectrogram.
+        """Compute STFT (center=False) and return compressed complex spectrogram.
 
-        Always uses center=False internally. For models trained with
-        center=True, context emulation is handled by process_samples.
+        Streaming uses center=False internally; center=True emulation is
+        handled by process_samples which prepends past context.
         """
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
 
-        _, _, com = mag_pha_stft(
-            audio,
-            n_fft=self.n_fft,
-            hop_size=self.hop_size,
-            win_size=self.win_size,
-            compress_factor=self.compress_factor,
-            center=False,
+        hann_window = torch.hann_window(self.win_size).to(audio.device)
+        stft_spec = torch.stft(
+            audio, self.n_fft, hop_length=self.hop_size, win_length=self.win_size,
+            window=hann_window, center=False, pad_mode='reflect',
+            normalized=False, return_complex=True,
         )
+        stft_spec = torch.view_as_real(stft_spec)
+        mag = torch.sqrt(stft_spec.pow(2).sum(-1) + 1e-9)
+        pha = torch.atan2(stft_spec[:, :, :, 1] + 1e-8, stft_spec[:, :, :, 0] + 1e-8)
+        mag = torch.pow(mag, self.compress_factor)
+        com = torch.stack((mag * torch.cos(pha), mag * torch.sin(pha)), dim=-1)
+
         return com
 
     def _process_encoder(
@@ -779,7 +761,7 @@ class LaCoSENet(nn.Module):
         samples = samples.to(self.device)
 
         # Ensure STFT context is on the same device (needed on first call after reset)
-        if self.stft_center and self._stft_context.device != samples.device:
+        if self._stft_context.device != samples.device:
             self._stft_context = self._stft_context.to(samples.device)
 
         # Add to buffer
@@ -792,24 +774,20 @@ class LaCoSENet(nn.Module):
         # Extract chunk for processing
         chunk_samples = self.input_buffer[:self.samples_per_chunk]
 
-        if self.stft_center:
-            # center=True training: prepend real past context for STFT emulation.
-            context_size = self.win_size // 2
-            chunk_with_context = torch.cat([self._stft_context.to(chunk_samples.device), chunk_samples])
-            spectrogram = self._stft(chunk_with_context)
+        # Prepend real past context for STFT center emulation.
+        context_size = self.win_size // 2
+        chunk_with_context = torch.cat([self._stft_context.to(chunk_samples.device), chunk_samples])
+        spectrogram = self._stft(chunk_with_context)
 
-            # Save context for next chunk
-            advance = self.output_samples_per_chunk
-            if advance >= context_size:
-                self._stft_context = self.input_buffer[advance - context_size:advance].clone()
-            else:
-                need_from_prev = context_size - advance
-                prev_part = self._stft_context[len(self._stft_context) - need_from_prev:]
-                curr_part = self.input_buffer[:advance]
-                self._stft_context = torch.cat([prev_part, curr_part]).clone()
+        # Save context for next chunk
+        advance = self.output_samples_per_chunk
+        if advance >= context_size:
+            self._stft_context = self.input_buffer[advance - context_size:advance].clone()
         else:
-            # center=False training: direct STFT, no context needed
-            spectrogram = self._stft(chunk_samples)
+            need_from_prev = context_size - advance
+            prev_part = self._stft_context[len(self._stft_context) - need_from_prev:]
+            curr_part = self.input_buffer[:advance]
+            self._stft_context = torch.cat([prev_part, curr_part]).clone()
 
         # Process through buffered model
         result = self.process_spectrogram_buffered(spectrogram)
@@ -912,18 +890,13 @@ class LaCoSENet(nn.Module):
         padded = torch.cat([audio, torch.zeros(flush_size, device=device)])
 
         osp = self.output_samples_per_chunk
-        if self.stft_center:
-            # center=True: prepend context_size zeros to replicate streaming context
-            context_size = self.win_size // 2
-            pre_padded = torch.cat([
-                torch.zeros(context_size, device=device),
-                padded,
-            ])
-            stft_input_len = context_size + self.samples_per_chunk
-        else:
-            # center=False: no context prepending needed
-            pre_padded = padded
-            stft_input_len = self.samples_per_chunk
+        # Prepend context_size zeros to replicate streaming context
+        context_size = self.win_size // 2
+        pre_padded = torch.cat([
+            torch.zeros(context_size, device=device),
+            padded,
+        ])
+        stft_input_len = context_size + self.samples_per_chunk
 
         # Number of spectrogram calls (same count as process_samples processing calls)
         n_calls = (len(pre_padded) - stft_input_len) // osp + 1
@@ -933,14 +906,17 @@ class LaCoSENet(nn.Module):
         batch_input = batch_input[:n_calls]
 
         # Single batched STFT (center=False: past/future context already in windows)
-        _, _, batch_com = mag_pha_stft(
-            batch_input,
-            n_fft=self.n_fft,
-            hop_size=self.hop_size,
-            win_size=self.win_size,
-            compress_factor=self.compress_factor,
-            center=False,
+        hann_window = torch.hann_window(self.win_size).to(device)
+        stft_spec = torch.stft(
+            batch_input, self.n_fft, hop_length=self.hop_size, win_length=self.win_size,
+            window=hann_window, center=False, pad_mode='reflect',
+            normalized=False, return_complex=True,
         )
+        stft_spec = torch.view_as_real(stft_spec)
+        mag = torch.sqrt(stft_spec.pow(2).sum(-1) + 1e-9)
+        pha = torch.atan2(stft_spec[:, :, :, 1] + 1e-8, stft_spec[:, :, :, 0] + 1e-8)
+        mag = torch.pow(mag, self.compress_factor)
+        batch_com = torch.stack((mag * torch.cos(pha), mag * torch.sin(pha)), dim=-1)
         # batch_com: [N, F, total_frames_needed, 2] — exact frame count, no skip needed
 
         # --- Phase 2: Sequential model forward (tight loop) ---

@@ -9,7 +9,6 @@ Key Functions:
     - convert_to_stateful: Convert model's conv layers to stateful versions
     - set_streaming_mode: Enable/disable streaming mode for all layers
     - reset_streaming_state: Reset all streaming states for new utterance
-    - get_total_state_size: Calculate memory footprint of streaming state
 
 For the Stateful convolution layers, see:
     src.models.streaming.layers.stateful_conv
@@ -31,9 +30,6 @@ Example:
     >>>
     >>> # New utterance
     >>> reset_streaming_state(stateful_model)
-
-Reference:
-    See docs/STATEFUL_STREAMING_TECH_SPEC.md Section 7 for implementation details.
 """
 
 from __future__ import annotations
@@ -41,9 +37,8 @@ from __future__ import annotations
 import copy
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Type
+from typing import Callable, Dict, Type
 
-import torch
 import torch.nn as nn
 
 from src.models.backbone import AsymmetricConv2d, CausalConv1d, CausalConv2d
@@ -213,51 +208,6 @@ def reset_streaming_state(model: nn.Module) -> int:
     return reset_count
 
 
-def get_total_state_size(model: nn.Module) -> Dict[str, Any]:
-    """
-    Calculate total state buffer size for streaming.
-
-    Useful for estimating memory requirements for streaming inference.
-
-    Args:
-        model: Stateful model
-
-    Returns:
-        Dictionary with state size information:
-        - total_params: Total number of parameters in all states
-        - total_bytes: Total memory in bytes
-        - total_mb: Total memory in megabytes
-        - layers: List of per-layer state information
-    """
-    total_params = 0
-    total_bytes = 0
-    layer_info: List[Dict[str, Any]] = []
-
-    for name, module in model.named_modules():
-        if hasattr(module, "_state") and module._state is not None:
-            state = module._state
-            params = state.numel()
-            bytes_size = params * state.element_size()
-            total_params += params
-            total_bytes += bytes_size
-            layer_info.append(
-                {
-                    "name": name,
-                    "shape": list(state.shape),
-                    "params": params,
-                    "bytes": bytes_size,
-                    "dtype": str(state.dtype),
-                }
-            )
-
-    return {
-        "total_params": total_params,
-        "total_bytes": total_bytes,
-        "total_mb": total_bytes / (1024 * 1024),
-        "layers": layer_info,
-    }
-
-
 def get_stateful_layer_count(model: nn.Module) -> Dict[str, int]:
     """
     Count stateful layers by type.
@@ -287,63 +237,3 @@ def get_stateful_layer_count(model: nn.Module) -> Dict[str, int]:
             counts["total"] += 1
 
     return counts
-
-
-def verify_stateful_conversion(original: nn.Module, stateful: nn.Module) -> bool:
-    """
-    Verify that stateful conversion preserves model output.
-
-    Compares outputs of original and stateful models in non-streaming mode
-    to ensure weights were correctly transferred.
-
-    Args:
-        original: Original model
-        stateful: Stateful-converted model
-
-    Returns:
-        True if outputs match within tolerance
-
-    Raises:
-        AssertionError: If outputs don't match
-    """
-    original.eval()
-    stateful.eval()
-
-    # Disable streaming for comparison
-    set_streaming_mode(stateful, False)
-
-    # Create test input based on model's expected input
-    # Assuming spectrogram input [B, F, T, 2] for Backbone
-    with torch.no_grad():
-        # Test with random input
-        test_input = torch.randn(1, 201, 100, 2)
-
-        original_device = next(original.parameters()).device
-        stateful_device = next(stateful.parameters()).device
-
-        test_input_orig = test_input.to(original_device)
-        test_input_stat = test_input.to(stateful_device)
-
-        try:
-            output_orig = original(test_input_orig)
-            output_stat = stateful(test_input_stat)
-
-            # Compare outputs (handle tuple output)
-            if isinstance(output_orig, tuple):
-                for i, (o_orig, o_stat) in enumerate(zip(output_orig, output_stat)):
-                    if not torch.allclose(o_orig, o_stat.to(o_orig.device), atol=1e-5):
-                        logger.error(f"Output {i} mismatch in verification")
-                        return False
-            else:
-                if not torch.allclose(
-                    output_orig, output_stat.to(output_orig.device), atol=1e-5
-                ):
-                    logger.error("Output mismatch in verification")
-                    return False
-
-            logger.info("Stateful conversion verified: outputs match")
-            return True
-
-        except Exception as e:
-            logger.error(f"Verification failed with error: {e}")
-            return False

@@ -210,7 +210,6 @@ class STFTConfig:
     win_size: int = 400
     compress_factor: float = 0.3
     sample_rate: int = 16000
-    stft_center: bool = True
 
     @property
     def freq_size(self) -> int:
@@ -303,8 +302,7 @@ class ONNXLaCoSENet:
         self.output_samples_per_chunk = self.output_frames_per_chunk * self.hop_size
 
         # Latency calculation (matches LaCoSENet)
-        self.stft_center = stft_config.stft_center
-        self.stft_center_delay_samples = self.win_size // 2 if self.stft_center else 0
+        self.stft_center_delay_samples = self.win_size // 2
         self.latency_samples = self.total_lookahead * self.hop_size + self.stft_center_delay_samples
         self.latency_ms = self.latency_samples / self.sample_rate * 1000
 
@@ -492,7 +490,6 @@ class ONNXLaCoSENet:
             win_size=pytorch_streaming.win_size,
             compress_factor=pytorch_streaming.compress_factor,
             sample_rate=pytorch_streaming.sample_rate,
-            stft_center=pytorch_streaming.stft_center,
         )
 
         # Step 2: Convert to exportable core
@@ -521,7 +518,7 @@ class ONNXLaCoSENet:
         # This matches the PyTorch buffered streaming design where the decoder consumes
         # an extended window (current + lookahead) while state updates advance only
         # by chunk_size frames per step.
-        stft_lookahead = 1  # Default for center=True STFT
+        stft_lookahead = 1  # STFT center=True emulation
         input_lookahead_frames = max(stft_lookahead, encoder_lookahead)
         export_time_frames = chunk_size + input_lookahead_frames + decoder_lookahead
 
@@ -783,7 +780,6 @@ class ONNXLaCoSENet:
             hop_size=self.hop_size,
             win_size=self.win_size,
             compress_factor=self.compress_factor,
-            center=True
         )
         return mag, pha
 
@@ -795,7 +791,6 @@ class ONNXLaCoSENet:
             hop_size=self.hop_size,
             win_size=self.win_size,
             compress_factor=self.compress_factor,
-            center=True
         )
 
     def _run_onnx(

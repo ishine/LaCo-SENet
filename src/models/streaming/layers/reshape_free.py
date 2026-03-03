@@ -29,51 +29,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-class AxisLayerNorm(nn.Module):
-    """
-    Layer normalization along a specific axis.
-
-    For time processing: normalizes along T axis (dim=2)
-    For freq processing: normalizes along F axis (dim=3)
-
-    Args:
-        channels: Number of channels
-        axis: 'time' or 'freq'
-        eps: Small constant for numerical stability
-    """
-
-    def __init__(self, channels: int, axis: str = "time", eps: float = 1e-6):
-        super().__init__()
-        self.channels = channels
-        self.axis = axis
-        self.eps = eps
-
-        # Learnable parameters [C, 1, 1] for broadcasting
-        self.weight = nn.Parameter(torch.ones(channels, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(channels, 1, 1))
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: Input tensor [B, C, T, F]
-
-        Returns:
-            Normalized tensor [B, C, T, F]
-        """
-        if self.axis == "time":
-            # Normalize along T axis (each freq bin independently)
-            norm_dim = 2
-        else:
-            # Normalize along F axis (each time frame independently)
-            norm_dim = 3
-
-        mean = x.mean(dim=norm_dim, keepdim=True)
-        var = x.var(dim=norm_dim, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / (var + self.eps).sqrt()
-
-        return x_norm * self.weight + self.bias
-
-
 class ChannelLayerNorm2d(nn.Module):
     """
     Channel-wise layer normalization for 4D tensors [B, C, T, F].
@@ -479,7 +434,6 @@ class ReshapeFreeTSBlock(nn.Module):
 
 
 __all__ = [
-    "AxisLayerNorm",
     "ChannelLayerNorm2d",
     "SimpleGate2d",
     "CausalConv2dTime",

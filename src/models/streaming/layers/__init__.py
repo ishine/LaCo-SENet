@@ -18,7 +18,6 @@ Example:
 """
 
 from .reshape_free import (
-    AxisLayerNorm,
     CausalConv2dTime,
     ReshapeFreeCAB,
     ReshapeFreeGPKFFN,
@@ -43,7 +42,6 @@ __all__ = [
     "StatefulAsymmetricConv2d",
     "StatefulCausalConv2d",
     # Reshape-Free layers (batch_size=1 optimized)
-    "AxisLayerNorm",
     "SimpleGate2d",
     "CausalConv2dTime",
     "ReshapeFreeCAB",

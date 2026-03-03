@@ -7,14 +7,14 @@ Provides BN folding optimization for CPU streaming inference:
 pairs into single convolution layers, eliminating BN computation overhead.
 
 Usage:
-    >>> from src.models.streaming.cpu_optimizations import optimize_for_cpu
-    >>> model, stats = optimize_for_cpu(model)
+    >>> from src.models.streaming.cpu_optimizations import fold_batchnorm
+    >>> model, fused_count = fold_batchnorm(model)
 """
 
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -138,27 +138,3 @@ def fold_batchnorm(model: nn.Module) -> Tuple[nn.Module, int]:
                 i += 1
 
     return model, fused_count
-
-
-def optimize_for_cpu(
-    model: nn.Module, verbose: bool = True
-) -> Tuple[nn.Module, Dict[str, Any]]:
-    """Apply CPU optimizations: BN folding.
-
-    Args:
-        model: Backbone model (should be in eval mode).
-        verbose: Print optimization summary.
-
-    Returns:
-        Tuple of (optimized_model, stats_dict).
-    """
-    stats: Dict[str, Any] = {}
-
-    model, fused_count = fold_batchnorm(model)
-    stats["bn_fused"] = fused_count
-
-    if verbose:
-        print(f"  CPU Optimizations Applied:")
-        print(f"    - BN Folding: {fused_count} pairs fused")
-
-    return model, stats

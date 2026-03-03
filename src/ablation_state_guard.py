@@ -6,6 +6,14 @@ across different models and chunk sizes. When disabled, lookahead frames
 contaminate streaming state buffers, causing quality degradation proportional
 to the lookahead-to-chunk ratio.
 
+Note on metrics:
+    Streaming inference uses a different iSTFT frontend (manual OLA) than the
+    offline path (torch.istft). For models with large lookahead, the mismatch
+    concentrates near the tail boundary due to lookahead flush padding. Therefore,
+    this ablation trims the last 30 frames (30 * hop_size samples) from both clean
+    and enhanced signals before metric computation, to reduce tail-boundary
+    artifacts unrelated to the state-guard mechanism being studied.
+
 Usage:
     # Full matrix (5 models × 3 chunk_sizes × 2 conditions = 30 evaluations)
     python -m src.ablation_state_guard --device cuda
@@ -73,9 +81,12 @@ def run_single_evaluation(exp_dir, chkpt_file, conf, chunk_size,
     )
 
     shift_samples = la["stft_center_delay_samples"]
+    tail_trim_frames = 30
+    tail_trim_samples = tail_trim_frames * la["hop_size"]
     metrics = evaluate_streaming_single(
         streaming, data_loader, device, logger,
         shift_samples=shift_samples,
+        tail_trim_samples=tail_trim_samples,
     )
 
     del streaming
@@ -191,6 +202,7 @@ def main():
                     "encoder_lookahead": la["encoder_lookahead"],
                     "decoder_lookahead": la["decoder_lookahead"],
                     "total_lookahead": la["total_lookahead"],
+                    "tail_trim_frames": 30,
                     "test_metrics": metrics,
                 }
 

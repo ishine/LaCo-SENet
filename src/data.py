@@ -3,8 +3,6 @@ import torch
 import torch.utils.data
 import torch.nn.functional as F
 import numpy as np
-from src.pcs400 import cal_pcs
-
 
 def random_sample(noisy, clean, segment):
     length = noisy.shape[-1]
@@ -49,11 +47,10 @@ def segment_sample(noisy, clean, segment):
 
 
 class VoiceBankDataset(torch.utils.data.Dataset):
-    def __init__(self, datapair_list, segment=None, with_id=False, with_text=False, use_pcs400=False):
+    def __init__(self, datapair_list, segment=None, with_id=False, with_text=False):
         self.segment = segment
         self.with_id = with_id
         self.with_text = with_text
-        self.use_pcs400 = use_pcs400
         self.sampling_rate = 16000
         self.audio_pairs = []
 
@@ -61,8 +58,6 @@ class VoiceBankDataset(torch.utils.data.Dataset):
             id = item["id"]
             noisy = item["noisy"]["array"].astype("float32")
             clean = item["clean"]["array"].astype("float32")
-            if self.use_pcs400:
-                clean = cal_pcs(clean)
             # Power normalization
             norm_factor = np.sqrt(noisy.shape[-1] / np.sum(noisy ** 2.0))
             noisy = noisy * norm_factor
